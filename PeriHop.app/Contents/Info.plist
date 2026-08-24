@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>PeriHop</string>
+    <key>CFBundleDisplayName</key>
+    <string>PeriHop</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.posadskiy.perihop</string>
+    <key>CFBundleVersion</key>
+    <string>1.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleExecutable</key>
+    <string>PeriHop</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>PeriHop needs Bluetooth access to unpair and re-pair your keyboard and trackpad when switching Macs.</string>
+    <key>NSBluetoothPeripheralUsageDescription</key>
+    <string>PeriHop needs Bluetooth access to unpair and re-pair your keyboard and trackpad when switching Macs.</string>
+</dict>
+</plist>
