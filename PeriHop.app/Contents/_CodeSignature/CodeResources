@@ -8,6 +8,10 @@
 		<data>
 		XTRUQzcnk+npab0sKVqdeD5DQBs=
 		</data>
+		<key>Resources/THIRD_PARTY_LICENSES.md</key>
+		<data>
+		wDvlJHaNOXJyyq6hvCFjBnmLG+A=
+		</data>
 		<key>Resources/blueutil</key>
 		<data>
 		BsvilgZGSc2GeELsk/Lw5OoI9HA=
@@ -20,6 +24,13 @@
 			<key>hash2</key>
 			<data>
 			tmpd1FICYC15oOfaCyO7mbt5FwQM8inINB19+Gr99f8=
+			</data>
+		</dict>
+		<key>Resources/THIRD_PARTY_LICENSES.md</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			RWOVGXn+wTmWZeBen3rycjJikTcuMeHa1Agpq8xHPwg=
 			</data>
 		</dict>
 		<key>Resources/blueutil</key>

@@ -6,12 +6,15 @@ struct ContentView: View {
     @State private var config: DeviceConfig? = DeviceConfigStore.load()
     @State private var showSetup = false
     @State private var showSettings = false
+    @State private var showInfo = false
     @State private var blueutilMissing = BluetoothController.blueutilPath == nil
 
     var body: some View {
         Group {
             if blueutilMissing {
                 missingBlueutilView
+            } else if showInfo {
+                InfoView(onDone: { showInfo = false })
             } else if showSettings {
                 SettingsView(onDone: { showSettings = false })
             } else if showSetup || config == nil {
@@ -57,6 +60,13 @@ struct ContentView: View {
                 Image(systemName: "keyboard")
                 Text("PeriHop").font(.headline)
                 Spacer()
+                Button {
+                    showInfo = true
+                } label: {
+                    Image(systemName: "info.circle")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
                 Button {
                     showSettings = true
                 } label: {
