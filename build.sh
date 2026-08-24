@@ -29,6 +29,7 @@ cp "Sources/$APP_NAME/Info.plist" "$APP_DIR/Contents/Info.plist"
 cp "Vendor/blueutil" "$APP_DIR/Contents/Resources/blueutil"
 chmod +x "$APP_DIR/Contents/Resources/blueutil"
 cp "Resources/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
+cp "THIRD_PARTY_LICENSES.md" "$APP_DIR/Contents/Resources/THIRD_PARTY_LICENSES.md"
 
 echo "==> Signing (ad-hoc, binds Info.plist so macOS gives it a stable identity)..."
 codesign --force --deep --sign - "$APP_DIR"
