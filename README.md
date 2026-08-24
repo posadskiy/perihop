@@ -36,10 +36,18 @@ connected yet, slide its switch to OFF then back to ON and use "Scan for
 New Devices".
 
 **Switching Macs** — click the menu bar icon → "Switch Devices". It unpairs
-the selected devices on this Mac, then prompts you to power-cycle them so
-they can be discovered again, then re-pairs and connects.
+the selected devices on this Mac, then automatically retries pairing and
+connecting every few seconds — just slide each device's switch to OFF then
+back to ON and it reconnects on its own, no need to click anything once
+that starts. "Stop" halts retrying (the devices stay unpaired from this Mac
+either way, since that's what makes them available to pair elsewhere).
 
 **Changing devices** — "Edit Devices…" re-runs the same scan/select flow.
+
+**Settings** — the gear icon in the popover has:
+- **Launch at Login**
+- **Show device addresses** — off by default; shows each device's MAC
+  address under its name in Edit Devices, for troubleshooting.
 
 Config is stored at `~/Library/Application Support/PeriHop/config.json`.
 

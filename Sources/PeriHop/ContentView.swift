@@ -5,12 +5,15 @@ struct ContentView: View {
     @StateObject private var switchFlow = SwitchFlowViewModel()
     @State private var config: DeviceConfig? = DeviceConfigStore.load()
     @State private var showSetup = false
+    @State private var showSettings = false
     @State private var blueutilMissing = BluetoothController.blueutilPath == nil
 
     var body: some View {
         Group {
             if blueutilMissing {
                 missingBlueutilView
+            } else if showSettings {
+                SettingsView(onDone: { showSettings = false })
             } else if showSetup || config == nil {
                 SetupView(
                     existing: config,
@@ -54,6 +57,13 @@ struct ContentView: View {
                 Image(systemName: "keyboard")
                 Text("PeriHop").font(.headline)
                 Spacer()
+                Button {
+                    showSettings = true
+                } label: {
+                    Image(systemName: "gearshape")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
             }
 
             ForEach(config.devices, id: \.address) { device in
@@ -74,23 +84,16 @@ struct ContentView: View {
                     Text("Unpairing…").font(.caption)
                 }
 
-            case .awaitingPairingMode:
+            case .reconnecting:
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("Slide each device's switch to OFF, then back to ON, then continue.")
+                    Text("Devices are unpaired from this Mac. Slide each switch to OFF, then back to ON — reconnecting automatically.")
                         .font(.caption)
                         .fixedSize(horizontal: false, vertical: true)
                     HStack {
-                        Button("Cancel") { switchFlow.reset() }
+                        ProgressView().controlSize(.small)
                         Spacer()
-                        Button("Continue") { switchFlow.userConfirmedPairingMode() }
-                            .buttonStyle(.borderedProminent)
+                        Button("Stop") { switchFlow.stop() }
                     }
-                }
-
-            case .connecting:
-                HStack {
-                    ProgressView().controlSize(.small)
-                    Text("Connecting…").font(.caption)
                 }
             }
 

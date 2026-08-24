@@ -12,8 +12,9 @@ final class SwitchFlowViewModel: ObservableObject {
     enum Stage: Equatable {
         case idle
         case unpairing
-        case awaitingPairingMode
-        case connecting
+        /// Unpaired, waiting for devices to reconnect. Retries pairing
+        /// automatically in the background — no manual "Continue" needed.
+        case reconnecting
         case finished
     }
 
@@ -21,6 +22,7 @@ final class SwitchFlowViewModel: ObservableObject {
     @Published private(set) var statuses: [String: DeviceStatus] = [:]
 
     private var config: DeviceConfig?
+    private var reconnectTasks: [String: Task<Void, Never>] = [:]
 
     func status(for address: String) -> DeviceStatus {
         statuses[address] ?? .pending
@@ -59,52 +61,82 @@ final class SwitchFlowViewModel: ObservableObject {
                     BluetoothController.unpair(address)
                 }
             }.value
-            stage = .awaitingPairingMode
+            beginReconnecting()
         }
     }
 
-    func userConfirmedPairingMode() {
-        guard let config else { return }
-        stage = .connecting
-        for entry in config.devices {
-            Task { await connect(entry: entry) }
-        }
+    /// Stops retrying. The devices were already unpaired on this Mac in the
+    /// unpair step — that's not reversible from here, so this just stops
+    /// automatic reconnect attempts rather than pretending to undo it.
+    func stop() {
+        cancelReconnectTasks()
+        stage = .idle
     }
 
     func retry(_ address: String) {
         guard let entry = config?.devices.first(where: { $0.address == address }) else { return }
-        Task { await connect(entry: entry) }
+        reconnectTasks[address]?.cancel()
+        stage = .reconnecting
+        reconnectTasks[address] = Task { await self.reconnectLoop(entry: entry) }
     }
 
-    func reset() {
-        stage = .idle
-        statuses = [:]
-    }
-
-    private func connect(entry: DeviceEntry) async {
-        statuses[entry.address] = .working
-        let address = entry.address
-
-        let result: Result<Void, Error> = await Task.detached(priority: .userInitiated) {
-            do {
-                try BluetoothController.pair(address)
-                try BluetoothController.connect(address)
-                guard BluetoothController.waitConnect(address, timeout: 30) else {
-                    throw BlueUtilError.commandFailed("Timed out waiting for \(address) to connect")
-                }
-                return .success(())
-            } catch {
-                return .failure(error)
-            }
-        }.value
-
-        switch result {
-        case .success:
-            statuses[entry.address] = .success
-        case .failure(let error):
-            statuses[entry.address] = .failure(error.localizedDescription)
+    private func beginReconnecting() {
+        guard let config else { return }
+        stage = .reconnecting
+        for entry in config.devices {
+            reconnectTasks[entry.address]?.cancel()
+            reconnectTasks[entry.address] = Task { await self.reconnectLoop(entry: entry) }
         }
-        checkFinished()
+    }
+
+    /// Retries pair + connect every few seconds so the user just has to slide
+    /// the switches off/on — no click needed to tell the app they're ready.
+    private func reconnectLoop(entry: DeviceEntry) async {
+        let address = entry.address
+        statuses[address] = .working
+        let deadline = Date().addingTimeInterval(90)
+        var lastMessage = "Timed out waiting to reconnect."
+
+        while !Task.isCancelled {
+            let result: Result<Void, Error> = await Task.detached(priority: .userInitiated) {
+                do {
+                    try BluetoothController.pair(address)
+                    try BluetoothController.connect(address)
+                    guard BluetoothController.waitConnect(address, timeout: 5) else {
+                        throw BlueUtilError.commandFailed("Not responding yet.")
+                    }
+                    return .success(())
+                } catch {
+                    return .failure(error)
+                }
+            }.value
+
+            if Task.isCancelled { return }
+
+            switch result {
+            case .success:
+                statuses[address] = .success
+                checkFinished()
+                return
+            case .failure(let error):
+                lastMessage = error.localizedDescription
+            }
+
+            if Date() >= deadline {
+                statuses[address] = .failure(lastMessage)
+                checkFinished()
+                return
+            }
+
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+        }
+    }
+
+    private func cancelReconnectTasks() {
+        for task in reconnectTasks.values {
+            task.cancel()
+        }
+        reconnectTasks.removeAll()
     }
 
     private func checkFinished() {

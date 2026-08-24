@@ -11,6 +11,7 @@ struct SetupView: View {
     @State private var selectedAddresses: Set<String> = []
     @State private var errorMessage: String?
     @State private var infoMessage: String?
+    @AppStorage("showDeviceAddresses") private var showDeviceAddresses = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -94,7 +95,9 @@ struct SetupView: View {
                     .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(device.name).font(.subheadline)
-                    Text(device.address).font(.caption2).foregroundStyle(.secondary)
+                    if showDeviceAddresses {
+                        Text(device.address).font(.caption2).foregroundStyle(.secondary)
+                    }
                 }
                 Spacer()
             }
