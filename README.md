@@ -1,31 +1,39 @@
 # PeriHop
 
-Menu bar app for switching a Bluetooth keyboard + trackpad from one Mac to
-another. Handles the unpair → re-pair → connect dance that macOS doesn't
-offer as a built-in feature.
+[![Build](https://github.com/posadskiy/perihop/actions/workflows/build.yml/badge.svg)](https://github.com/posadskiy/perihop/actions/workflows/build.yml)
+[![Latest release](https://img.shields.io/github/v/release/posadskiy/perihop)](https://github.com/posadskiy/perihop/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Platform: macOS](https://img.shields.io/badge/platform-macOS%2013%2B-lightgrey)](#requirements)
 
-Bundles a compiled copy of [blueutil](https://github.com/toy/blueutil)
-(`Vendor/blueutil`, universal arm64/x86_64) — end users don't need Homebrew
-or anything else installed. See [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
+Menu bar app for switching a Bluetooth keyboard, trackpad, or mouse from one
+Mac to another. macOS has no built-in way to do this — you either dig through
+System Settings to unpair and re-pair by hand, or buy a $10 paid utility.
+PeriHop does the unpair → re-pair → connect dance for you, automatically,
+from the menu bar.
 
-## Build
+## Features
 
-```bash
-./build.sh
-open PeriHop.app
-```
+- **Menu bar only** — no Dock icon, no windows to manage
+- **Pick any devices** — keyboard, trackpad, mouse, or any other Bluetooth
+  accessory; not locked to a fixed "keyboard + trackpad" pair
+- **Automatic reconnect** — after unpairing, PeriHop retries pairing in the
+  background until you flip the device's switch off/on; no manual "continue"
+  step
+- **Zero dependencies** — bundles a compiled copy of
+  [blueutil](https://github.com/toy/blueutil); no Homebrew or anything else
+  to install
+- **Universal binary** — runs natively on Apple Silicon and Intel
 
-This produces `PeriHop.app` — a menu bar–only app (no Dock icon). Since it's
-unsigned, the first launch may need a right-click → Open to get past
-Gatekeeper.
+## Install
 
-For quick iteration during development you can also run it unbundled (it'll
-show a Dock icon since `Info.plist`'s `LSUIElement` only applies inside a
-real `.app` bundle):
+Download the latest build from [Releases](https://github.com/posadskiy/perihop/releases/latest),
+unzip, and drag `PeriHop.app` to `/Applications`.
 
-```bash
-swift run
-```
+Since it's unsigned (no Apple Developer ID), the first launch needs a
+right-click → **Open** to get past Gatekeeper, instead of a plain
+double-click. macOS will also ask for Bluetooth access the first time you
+scan for or switch devices — grant it in the prompt, or in
+**System Settings → Privacy & Security → Bluetooth** if you missed it.
 
 ## Usage
 
@@ -51,7 +59,50 @@ either way, since that's what makes them available to pair elsewhere).
 
 Config is stored at `~/Library/Application Support/PeriHop/config.json`.
 
-## Relation to bt-grab.command
+## Requirements
 
-`bt-grab.command` is the original manual script this app replaces — kept
-here unmodified as a fallback / reference.
+- macOS 13 (Ventura) or later
+- A Bluetooth keyboard, trackpad, mouse, or other HID accessory
+
+## Building from source
+
+```bash
+git clone https://github.com/posadskiy/perihop.git
+cd perihop
+./build.sh
+open PeriHop.app
+```
+
+`build.sh` compiles for both Apple Silicon and Intel and `lipo`s them
+together into one universal `.app` — no full Xcode install required, just
+the Swift toolchain (ships with Xcode Command Line Tools).
+
+For quick iteration you can also run it unbundled — this shows a Dock icon
+though, since `Info.plist`'s `LSUIElement` only applies inside a real `.app`
+bundle:
+
+```bash
+swift run
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for more.
+
+## Contributing
+
+Bug reports, feature requests, and PRs are welcome — see
+[CONTRIBUTING.md](CONTRIBUTING.md). Please follow the
+[Code of Conduct](CODE_OF_CONDUCT.md).
+
+## Security
+
+See [SECURITY.md](SECURITY.md) for how to report vulnerabilities.
+
+## Acknowledgments
+
+- [blueutil](https://github.com/toy/blueutil) by Ivan Kuchin — the CLI
+  PeriHop wraps for all Bluetooth operations. Bundled as a compiled
+  universal binary; see [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
+
+## License
+
+[MIT](LICENSE)

@@ -1,0 +1,70 @@
+name: Bug Report
+description: Something in PeriHop isn't working right
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open PeriHop, click Switch Devices
+        2. Slide switches off/on
+        3. ...
+    validations:
+      required: true
+
+  - type: input
+    id: perihop-version
+    attributes:
+      label: PeriHop version
+      description: Menu bar icon → Settings, or the release you downloaded
+    validations:
+      required: true
+
+  - type: input
+    id: macos-version
+    attributes:
+      label: macOS version
+      placeholder: "e.g. macOS 15.1"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: mac-arch
+    attributes:
+      label: Mac chip
+      options:
+        - Apple Silicon (M-series)
+        - Intel
+    validations:
+      required: true
+
+  - type: dropdown
+    id: devices
+    attributes:
+      label: What device(s) were you switching?
+      multiple: true
+      options:
+        - Magic Keyboard
+        - Magic Trackpad
+        - Magic Mouse
+        - Other Bluetooth accessory
+    validations:
+      required: false
+
+  - type: textarea
+    id: error-message
+    attributes:
+      label: Error message (if any)
+      description: PeriHop's error boxes have a copy button — paste the exact text here.
+      render: text
+    validations:
+      required: false
