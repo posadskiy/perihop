@@ -41,17 +41,21 @@ struct InfoView: View {
 
             Divider()
 
-            VStack(alignment: .leading, spacing: 6) {
-                Link("Report an Issue", destination: URL(string: "https://github.com/posadskiy/perihop/issues/new/choose")!)
+            Button {
+                openIssueTracker()
+            } label: {
+                Label("Report an Issue", systemImage: "exclamationmark.bubble")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
-                Button("Third-Party Licenses") {
-                    openThirdPartyLicenses()
-                }
-                .buttonStyle(.plain)
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity)
             }
+            .buttonStyle(.bordered)
+
+            Button("Third-Party Licenses") {
+                openThirdPartyLicenses()
+            }
+            .buttonStyle(.plain)
+            .font(.caption)
+            .foregroundStyle(.secondary)
 
             Divider()
             HStack {
@@ -72,6 +76,12 @@ struct InfoView: View {
                 .foregroundStyle(.secondary)
                 .frame(width: 56, alignment: .leading)
             content()
+        }
+    }
+
+    private func openIssueTracker() {
+        if let url = URL(string: "https://github.com/posadskiy/perihop/issues/new/choose") {
+            NSWorkspace.shared.open(url)
         }
     }
 
