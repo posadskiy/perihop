@@ -8,6 +8,7 @@ struct ContentView: View {
     @State private var showSettings = false
     @State private var showInfo = false
     @State private var blueutilMissing = BluetoothController.blueutilPath == nil
+    @State private var saveErrorMessage: String?
 
     var body: some View {
         Group {
@@ -21,11 +22,18 @@ struct ContentView: View {
                 SetupView(
                     existing: config,
                     onSave: { newConfig in
-                        try? DeviceConfigStore.save(newConfig)
-                        config = newConfig
-                        showSetup = false
+                        do {
+                            try DeviceConfigStore.save(newConfig)
+                            saveErrorMessage = nil
+                            config = newConfig
+                            showSetup = false
+                        } catch {
+                            AppLog.config.error("Failed to save config: \(error)")
+                            saveErrorMessage = "Couldn't save: \(error.localizedDescription)"
+                        }
                     },
-                    onCancel: config == nil ? nil : { showSetup = false }
+                    onCancel: config == nil ? nil : { showSetup = false },
+                    saveErrorMessage: saveErrorMessage
                 )
             } else if let config {
                 mainView(config: config)
@@ -121,7 +129,8 @@ struct ContentView: View {
             // Re-checks real Bluetooth connection state every 10 seconds
             // while the popover is open, so the checkmark reflects reality
             // even if a device disconnects mid-session. refreshStatuses
-            // no-ops while a switch is in progress, so this can't race it.
+            // cancels any prior in-flight check itself, so overlapping polls
+            // can't stack up or resolve out of order.
             // Cancels automatically when the popover closes.
             while !Task.isCancelled {
                 switchFlow.refreshStatuses(config: config)
@@ -131,14 +140,17 @@ struct ContentView: View {
     }
 
     @ViewBuilder
-    private func deviceRow(name: String, status: DeviceStatus, address: String) -> some View {
+    private func deviceRow(name: String, status: DeviceStatus, address: DeviceAddress) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
                 Text(name).font(.subheadline)
                 Spacer()
                 switch status {
-                case .pending:
+                case .unknown:
                     EmptyView()
+                case .disconnected:
+                    Image(systemName: "circle")
+                        .foregroundStyle(.secondary)
                 case .working:
                     ProgressView().controlSize(.small)
                 case .success:

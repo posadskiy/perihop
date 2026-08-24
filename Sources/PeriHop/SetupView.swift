@@ -4,11 +4,12 @@ struct SetupView: View {
     var existing: DeviceConfig?
     var onSave: (DeviceConfig) -> Void
     var onCancel: (() -> Void)?
+    var saveErrorMessage: String?
 
     @State private var isLoadingPaired = false
     @State private var isScanning = false
     @State private var discovered: [BTDevice] = []
-    @State private var selectedAddresses: Set<String> = []
+    @State private var selectedAddresses: Set<DeviceAddress> = []
     @State private var errorMessage: String?
     @State private var infoMessage: String?
     @AppStorage("showDeviceAddresses") private var showDeviceAddresses = false
@@ -20,6 +21,10 @@ struct SetupView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+
+            if let saveErrorMessage {
+                ErrorBox(message: saveErrorMessage)
+            }
 
             if let errorMessage {
                 ErrorBox(message: errorMessage)
@@ -96,7 +101,7 @@ struct SetupView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(device.name).font(.subheadline)
                     if showDeviceAddresses {
-                        Text(device.address).font(.caption2).foregroundStyle(.secondary)
+                        Text(device.address.rawValue).font(.caption2).foregroundStyle(.secondary)
                     }
                 }
                 Spacer()
@@ -110,7 +115,7 @@ struct SetupView: View {
         !selectedAddresses.isEmpty
     }
 
-    private func toggle(_ address: String) {
+    private func toggle(_ address: DeviceAddress) {
         if selectedAddresses.contains(address) {
             selectedAddresses.remove(address)
         } else {
@@ -123,19 +128,12 @@ struct SetupView: View {
         infoMessage = nil
         isLoadingPaired = true
         Task {
-            let result: Result<[BTDevice], Error> = await Task.detached(priority: .userInitiated) {
-                do {
-                    return .success(try BluetoothController.paired())
-                } catch {
-                    return .failure(error)
-                }
-            }.value
-
-            isLoadingPaired = false
-            switch result {
-            case .success(let devices):
+            do {
+                let devices = try await BluetoothController.paired()
+                isLoadingPaired = false
                 mergeDiscovered(devices)
-            case .failure(let error):
+            } catch {
+                isLoadingPaired = false
                 errorMessage = error.localizedDescription
             }
         }
@@ -146,22 +144,15 @@ struct SetupView: View {
         infoMessage = nil
         isScanning = true
         Task {
-            let result: Result<[BTDevice], Error> = await Task.detached(priority: .userInitiated) {
-                do {
-                    return .success(try BluetoothController.inquiry(duration: 8))
-                } catch {
-                    return .failure(error)
-                }
-            }.value
-
-            isScanning = false
-            switch result {
-            case .success(let devices):
+            do {
+                let devices = try await BluetoothController.inquiry(duration: 8)
+                isScanning = false
                 mergeDiscovered(devices)
                 if devices.isEmpty {
                     infoMessage = "No new devices found. Make sure the device is in pairing mode and try again."
                 }
-            case .failure(let error):
+            } catch {
+                isScanning = false
                 errorMessage = error.localizedDescription
             }
         }

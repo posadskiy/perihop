@@ -2,7 +2,7 @@ import Foundation
 
 struct DeviceEntry: Codable, Equatable, Sendable {
     var name: String
-    var address: String
+    var address: DeviceAddress
 }
 
 struct DeviceConfig: Codable, Equatable, Sendable {
@@ -21,7 +21,12 @@ enum DeviceConfigStore {
 
     static func load() -> DeviceConfig? {
         guard let data = try? Data(contentsOf: fileURL) else { return nil }
-        return try? JSONDecoder().decode(DeviceConfig.self, from: data)
+        do {
+            return try JSONDecoder().decode(DeviceConfig.self, from: data)
+        } catch {
+            AppLog.config.error("Failed to decode saved config, starting fresh: \(error)")
+            return nil
+        }
     }
 
     static func save(_ config: DeviceConfig) throws {
