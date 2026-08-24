@@ -79,6 +79,19 @@ isn't needed there.
    welcome for UI changes — this is a menu bar app, so a static diff doesn't
    show much.
 
+## Releasing
+
+Bump `CFBundleShortVersionString` in
+[`Sources/PeriHop/Info.plist`](Sources/PeriHop/Info.plist), update
+`CHANGELOG.md`, and merge to `main`. The
+[release workflow](.github/workflows/release.yml) picks up the version
+change automatically, builds the universal `.app`, tags it `vX.Y.Z`, and
+publishes a GitHub Release with the zip attached — nothing else to do.
+
+To trigger it without a version bump (e.g. re-running after a failed build),
+use **Actions → Release → Run workflow** — it's a no-op if that version was
+already released.
+
 ## Reporting bugs / requesting features
 
 Use the [issue templates](https://github.com/posadskiy/perihop/issues/new/choose).

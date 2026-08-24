@@ -1,9 +1,16 @@
 name: Release
 
+# Auto-releases whenever CFBundleShortVersionString in Info.plist changes on
+# main (bump the version, merge, done). "Run workflow" in the Actions tab
+# triggers it manually too — either way it tags+releases the *current*
+# Info.plist version, and no-ops if that version was already released, so
+# it's safe to click without checking first.
 on:
   push:
-    tags:
-      - "v*"
+    branches: [main]
+    paths:
+      - "Sources/PeriHop/Info.plist"
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -13,16 +20,45 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read version from Info.plist
+        id: version
+        run: |
+          VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" Sources/PeriHop/Info.plist)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether this version is already released
+        id: check
+        run: |
+          if git rev-parse "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
+            echo "Already released ${{ steps.version.outputs.tag }} — nothing to do."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Build universal PeriHop.app
+        if: steps.check.outputs.exists == 'false'
         run: ./build.sh
 
       - name: Zip app
+        if: steps.check.outputs.exists == 'false'
         run: ditto -c -k --sequesterRsrc --keepParent PeriHop.app PeriHop.zip
 
-      - name: Create release
+      - name: Tag this version
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          git tag "${{ steps.version.outputs.tag }}"
+          git push origin "${{ steps.version.outputs.tag }}"
+
+      - name: Create GitHub release
+        if: steps.check.outputs.exists == 'false'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.version.outputs.tag }}
           files: PeriHop.zip
           generate_release_notes: true
           body: |
