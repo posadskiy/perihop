@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.0.0] - 2026-08-24
+## [0.1.0] - 2026-08-24
 
 ### Added
 - Menu bar app for switching Bluetooth keyboard/trackpad/mouse between Macs
@@ -17,3 +17,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Universal binary (Apple Silicon + Intel)
 - Launch at Login and "show device addresses" settings
 - App icon
+- Info panel (author, website, support email, version)
