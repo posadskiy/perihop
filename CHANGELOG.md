@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-20
+
 ### Added
 - The two Macs can link with a pairing code and hand the keyboard and trackpad over directly, including when the other Mac is asleep
 - A switch connects an existing bond first, and pairs again only if the accessory is in range and still refuses
@@ -16,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Closing the lid hands the devices to the other Mac when it answers, and waking does not steal them back
 
 ### Changed
+- Release builds are a Developer ID signed, notarized `PeriHop.dmg`
 - The release build is Apple Silicon only. The macOS 27 SDK deprecates x86_64
 - Bluetooth control now uses IOBluetooth in the app instead of shelling out to blueutil
 - "Switch Devices" is now "Use here" and "Hand off"

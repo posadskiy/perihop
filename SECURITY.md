@@ -21,9 +21,7 @@ prefer to remain anonymous.
 
 ## Scope notes
 
-PeriHop is unsigned and ad-hoc code-signed (no Apple Developer ID) — macOS
-Gatekeeper already surfaces this to users on first launch. Reports about
-"the app is unsigned" are expected and not considered a vulnerability on
-their own; reports about something that *bypasses* Gatekeeper's warning, or
-that could let an unpaired third party trigger pairing/unpairing without
-user action, are very much in scope.
+Release disk images are Developer ID signed and notarized. Reports about
+Gatekeeper rejecting an official `PeriHop.dmg`, or about something that
+bypasses Gatekeeper, or that could let an unpaired third party trigger
+pairing or unpairing without user action, are in scope.

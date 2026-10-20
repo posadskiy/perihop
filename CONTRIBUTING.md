@@ -19,9 +19,13 @@ To run it as a real menu bar app (needed to test anything involving
 `LSUIElement`, the app icon, or Bluetooth permissions properly):
 
 ```bash
+export NOTARY_KEYCHAIN_PROFILE="grammarbar-notary"
 ./build.sh
-open PeriHop.app
+open build/PeriHop.app
 ```
+
+`./build.sh` needs the Developer ID certificate in the login keychain and
+notarization credentials. `swift build` is enough to compile without those.
 
 `swift run` also works for quick iteration, but shows a Dock icon since
 `Info.plist` only applies inside a real `.app` bundle.
@@ -79,13 +83,20 @@ isn't needed there.
 Bump `CFBundleShortVersionString` in
 [`Sources/PeriHop/Info.plist`](Sources/PeriHop/Info.plist), update
 `CHANGELOG.md`, and merge to `main`. The
-[release workflow](.github/workflows/release.yml) picks up the version
-change automatically, builds the `.app`, tags it `vX.Y.Z`, and
-publishes a GitHub Release with the zip attached — nothing else to do.
+[release workflow](.github/workflows/release.yml) tags that version and
+opens a GitHub Release. It does not build the app: GitHub's runners do not
+have the Developer ID certificate.
 
-To trigger it without a version bump (e.g. re-running after a failed build),
-use **Actions → Release → Run workflow** — it's a no-op if that version was
-already released.
+On the Mac that signs GrammarBar, with `NOTARY_KEYCHAIN_PROFILE` set:
+
+```bash
+./build.sh
+gh release upload vX.Y.Z build/PeriHop.dmg
+```
+
+`build/PeriHop.dmg` is the file to put on the website. To trigger the
+workflow without a version bump, use **Actions → Release → Run workflow** —
+it's a no-op if that version was already released.
 
 ## Reporting bugs / requesting features
 

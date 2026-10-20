@@ -25,13 +25,11 @@ paid utility. PeriHop connects the accessory to the Mac you're using.
 
 ## Install
 
-Download the latest build from [Releases](https://github.com/posadskiy/perihop/releases/latest),
-unzip, and drag `PeriHop.app` to `/Applications`.
+Download `PeriHop.dmg`, open it, and drag PeriHop to Applications.
 
-Since it's unsigned (no Apple Developer ID), the first launch needs a
-right-click → **Open** to get past Gatekeeper, instead of a plain
-double-click. macOS will also ask for Bluetooth access the first time you
-scan for or switch devices — grant it in the prompt, or in
+The disk image is signed with a Developer ID and notarized, so Gatekeeper
+opens it on double-click. macOS will ask for Bluetooth access the first time
+you scan for or switch devices — grant it in the prompt, or in
 **System Settings → Privacy & Security → Bluetooth** if you missed it.
 
 ## Usage
@@ -88,13 +86,16 @@ The pairing code is stored in the Keychain.
 ```bash
 git clone https://github.com/posadskiy/perihop.git
 cd perihop
+export NOTARY_KEYCHAIN_PROFILE="grammarbar-notary"
 ./build.sh
-open PeriHop.app
+open build/PeriHop.app
 ```
 
-`build.sh` compiles a release arm64 binary and wraps it in `PeriHop.app` —
-no full Xcode install required, just the Swift toolchain (ships with Xcode
-Command Line Tools).
+`build.sh` compiles a release arm64 binary, signs it with the Developer ID
+already in the login keychain, notarizes it, and writes `build/PeriHop.dmg`.
+That disk image is what gets shared. The same Apple Developer team that signs
+GrammarBar signs PeriHop; no separate app record is required. The script
+needs the network so Apple can timestamp the signature and notarize the image.
 
 For quick iteration you can also run it unbundled — this shows a Dock icon
 though, since `Info.plist`'s `LSUIElement` only applies inside a real `.app`

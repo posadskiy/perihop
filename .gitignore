@@ -1,6 +1,8 @@
 # Build artifacts
 .build/
+build/
 PeriHop.app/
+*.dmg
 
 # macOS
 .DS_Store

@@ -1,10 +1,10 @@
 name: Release
 
-# Auto-releases whenever CFBundleShortVersionString in Info.plist changes on
-# main (bump the version, merge, done). "Run workflow" in the Actions tab
-# triggers it manually too — either way it tags+releases the *current*
-# Info.plist version, and no-ops if that version was already released, so
-# it's safe to click without checking first.
+# Tags and opens a GitHub Release when CFBundleShortVersionString changes on
+# main. The notarized disk image is built on a Mac with the Developer ID
+# certificate (./build.sh) and uploaded to that release. GitHub's runners
+# cannot sign it. "Run workflow" triggers the same tag step, and it no-ops
+# if that version was already released.
 on:
   push:
     branches: [main]
@@ -40,14 +40,6 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Build PeriHop.app
-        if: steps.check.outputs.exists == 'false'
-        run: ./build.sh
-
-      - name: Zip app
-        if: steps.check.outputs.exists == 'false'
-        run: ditto -c -k --sequesterRsrc --keepParent PeriHop.app PeriHop.zip
-
       - name: Tag this version
         if: steps.check.outputs.exists == 'false'
         run: |
@@ -59,9 +51,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
-          files: PeriHop.zip
           generate_release_notes: true
           body: |
-            Unsigned build — first launch needs right-click → Open (or
-            System Settings → Privacy & Security → Open Anyway) to get past
-            Gatekeeper. See the README for details.
+            Notarized build. Open PeriHop.dmg and drag PeriHop to Applications.
