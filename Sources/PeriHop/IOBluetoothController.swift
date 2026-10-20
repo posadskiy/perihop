@@ -4,18 +4,12 @@ import IOBluetooth
 /// In-process IOBluetooth. Calls stay off a spawned `blueutil` so a connect
 /// can be waited on, cancelled, and followed immediately by a pair.
 struct LiveBluetoothController: BluetoothControlling {
-    private let gate = BluetoothGate()
-
     func disconnect(_ address: DeviceAddress, timeout: TimeInterval) async throws {
-        try await gate.run {
-            try await IOBluetoothWork.shared.disconnect(address, timeout: timeout)
-        }
+        try await IOBluetoothWork.shared.disconnect(address, timeout: timeout)
     }
 
-    func connect(_ address: DeviceAddress, timeout: TimeInterval) async -> Bool {
-        await gate.run {
-            await IOBluetoothWork.shared.connect(address, timeout: timeout)
-        }
+    func connect(_ address: DeviceAddress, timeout: TimeInterval) async -> LinkResult {
+        await IOBluetoothWork.shared.connect(address, timeout: timeout)
     }
 
     func isConnected(_ address: DeviceAddress) async -> Bool {
@@ -39,21 +33,15 @@ struct LiveBluetoothController: BluetoothControlling {
     }
 
     func forget(_ address: DeviceAddress) async {
-        await gate.run {
-            await IOBluetoothWork.shared.forget(address)
-        }
+        await IOBluetoothWork.shared.forget(address)
     }
 
     func pair(_ address: DeviceAddress) async throws {
-        try await gate.run {
-            try await IOBluetoothWork.shared.pair(address)
-        }
+        try await IOBluetoothWork.shared.pair(address)
     }
 
     func waitUntilDiscovered(_ address: DeviceAddress, timeout: TimeInterval) async -> Bool {
-        await gate.run {
-            await IOBluetoothWork.shared.waitUntilDiscovered(address, timeout: timeout)
-        }
+        await IOBluetoothWork.shared.waitUntilDiscovered(address, timeout: timeout)
     }
 
     func cancelOperations() async {
@@ -61,56 +49,95 @@ struct LiveBluetoothController: BluetoothControlling {
     }
 
     func pairedDevices() async throws -> [BTDevice] {
-        try await IOBluetoothWork.shared.pairedDevices()
+        await IOBluetoothWork.shared.pairedDevices()
     }
 
     func inquire(timeout: TimeInterval) async throws -> [BTDevice] {
-        try await gate.run {
-            try await IOBluetoothWork.shared.inquire(timeout: timeout)
-        }
+        await IOBluetoothWork.shared.inquire(timeout: timeout)
     }
 }
 
-private actor BluetoothGate {
-    func run<T: Sendable>(_ body: @Sendable () async throws -> T) async rethrows -> T {
-        try await body()
-    }
-}
-
+/// Operations may overlap (a remote release can arrive mid-switch), so each
+/// one tracks its own session and its own cancellation instead of sharing a
+/// single slot or flag.
 @MainActor
 final class IOBluetoothWork {
     static let shared = IOBluetoothWork()
 
-    private var suppressTasks: [DeviceAddress: Task<Void, Never>] = [:]
-    private var inquiry: InquirySession?
-    private var pairSession: PairSession?
-    private var cancelled = false
+    private static let batteryKeys = [
+        "batteryPercentSingle", "batteryPercentCombined", "batteryPercentLeft", "batteryPercentRight",
+    ]
+
+    private let suppressor = ReconnectSuppressor()
+    private var sessions: [ObjectIdentifier: any BluetoothSession] = [:]
+    /// Bumped by `cancelOperations`. An operation that started under an older
+    /// value has been cancelled.
+    private var epoch = 0
+    private var loggedBattery: [DeviceAddress: Int] = [:]
 
     func disconnect(_ address: DeviceAddress, timeout: TimeInterval) async throws {
-        guard let device = device(for: address), device.isConnected() else { return }
-        let result = device.closeConnection()
-        if result != kIOReturnSuccess && device.isConnected() {
-            throw BluetoothError.failed("Couldn't disconnect \(address.rawValue).")
+        guard device(for: address)?.isConnected() == true else {
+            AppLog.bluetooth.info("disconnect \(address.rawValue) already down")
+            return
         }
         let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            guard let current = self.device(for: address), current.isConnected() else { return }
-            try? await Task.sleep(nanoseconds: 100_000_000)
+        var attempts = 0
+        while let current = device(for: address), current.isConnected() {
+            let result = current.closeConnection()
+            attempts += 1
+            AppLog.bluetooth.info("disconnect \(address.rawValue) close=\(IOReturnLabel.describe(result)) attempt=\(attempts)")
+            if result != kIOReturnSuccess && current.isConnected() && attempts == 1 {
+                throw BluetoothError.failed("Couldn't disconnect \(address.rawValue).")
+            }
+            if device(for: address)?.isConnected() != true { return }
+            guard Date() < deadline else { break }
+            try? await Task.sleep(nanoseconds: 200_000_000)
         }
-        if self.device(for: address)?.isConnected() == true {
+        if device(for: address)?.isConnected() == true {
+            AppLog.bluetooth.error("disconnect \(address.rawValue) still connected after \(timeout)s")
             throw BluetoothError.failed("Couldn't disconnect \(address.rawValue).")
         }
     }
 
-    func connect(_ address: DeviceAddress, timeout: TimeInterval) async -> Bool {
-        begin()
-        guard let device = device(for: address) else { return false }
-        if device.isConnected() { return true }
-        // Page timeout is in units of 0.625ms. Cap the block so a missing
-        // accessory can't freeze the menu for the stack's default.
+    func connect(_ address: DeviceAddress, timeout: TimeInterval) async -> LinkResult {
+        let started = epoch
+        guard let device = device(for: address) else {
+            AppLog.bluetooth.error("connect \(address.rawValue) no device record")
+            return .absent
+        }
+        if await held(device, since: started) {
+            AppLog.bluetooth.info("connect \(address.rawValue) already connected paired=\(device.isPaired())")
+            return .connected
+        }
+        guard !isCancelled(since: started) else { return .absent }
+        // Page timeout is in units of 0.625ms. A nil target makes this call
+        // synchronous and blocks the main actor for the whole page, so peer
+        // messages time out. Pass a target and wait for connectionComplete.
         let pages = BluetoothHCIPageTimeout(max(1, min(timeout / 0.000625, Double(UInt16.max))))
-        _ = device.openConnection(nil, withPageTimeout: pages, authenticationRequired: false)
-        return await pollConnected(device, timeout: timeout)
+        let began = Date()
+        let opened = await run(ConnectionSession()) {
+            await $0.open(device, pages: pages, timeout: timeout + 0.75)
+        }
+        let elapsed = String(format: "%.2f", Date().timeIntervalSince(began))
+        let connected = device.isConnected()
+        AppLog.bluetooth.info("connect \(address.rawValue) open=\(IOReturnLabel.describe(opened)) in \(elapsed)s paired=\(device.isPaired()) connected=\(connected) pageSlots=\(pages)")
+        if isCancelled(since: started) { return .absent }
+        // A timed-out page can still leave isConnected true for a few seconds.
+        // That is the invalid-link-key ACL: bluetoothd reports HID result 151
+        // and input never works. Only a stack success that stays up counts.
+        guard opened == kIOReturnSuccess else {
+            if connected {
+                AppLog.bluetooth.error("connect \(address.rawValue) link rejected")
+                return .refused
+            }
+            AppLog.bluetooth.info("connect \(address.rawValue) not connected")
+            return .absent
+        }
+        guard await held(device, since: started) else {
+            AppLog.bluetooth.error("connect \(address.rawValue) link dropped after open")
+            return .refused
+        }
+        return .connected
     }
 
     func isConnected(_ address: DeviceAddress) -> Bool {
@@ -123,35 +150,34 @@ final class IOBluetoothWork {
 
     func batteryPercent(_ address: DeviceAddress) -> Int? {
         guard let device = device(for: address) else { return nil }
-        let selector = NSSelectorFromString("batteryPercentSingle")
-        guard device.responds(to: selector) else { return nil }
-        let value = device.value(forKey: "batteryPercentSingle") as? NSNumber
-        let percent = value?.intValue ?? -1
-        guard (0...100).contains(percent) else { return nil }
-        return percent
+        let reported = Self.reportedBattery(device)
+        let registry = HIDBatteryRegistry.percent(address: address, name: device.name ?? "")
+        let chosen = BatteryLevel.choose(reported: reported, registry: registry)
+        let logged = chosen ?? 0
+        if loggedBattery[address] != logged {
+            loggedBattery[address] = logged
+            let raw = reported.map(String.init).joined(separator: ",")
+            AppLog.bluetooth.info("battery \(address.rawValue) bluetooth=[\(raw)] registry=\(registry.map(String.init) ?? "none") shown=\(chosen.map(String.init) ?? "hidden")")
+        }
+        return chosen
     }
 
     func suppress(_ address: DeviceAddress, safetyTimeout: TimeInterval) {
-        suppressTasks[address]?.cancel()
-        let deadline = Date().addingTimeInterval(safetyTimeout)
-        suppressTasks[address] = Task { @MainActor in
-            while !Task.isCancelled && Date() < deadline {
-                if let device = self.device(for: address), device.isConnected() {
-                    device.closeConnection()
-                }
-                try? await Task.sleep(nanoseconds: 400_000_000)
-            }
-            self.suppressTasks[address] = nil
+        suppressor.start(address, safetyTimeout: safetyTimeout) { [weak self] in
+            guard let device = self?.device(for: address), device.isConnected() else { return nil }
+            return device.closeConnection()
         }
     }
 
     func stopSuppressing(_ address: DeviceAddress) {
-        suppressTasks[address]?.cancel()
-        suppressTasks[address] = nil
+        suppressor.stop(address)
     }
 
     func forget(_ address: DeviceAddress) async {
-        guard let device = device(for: address) else { return }
+        guard let device = device(for: address) else {
+            AppLog.bluetooth.error("forget \(address.rawValue) no device record")
+            return
+        }
         if device.isConnected() {
             try? await disconnect(address, timeout: 2)
         }
@@ -161,72 +187,68 @@ final class IOBluetoothWork {
             return
         }
         _ = device.perform(remove)
-        AppLog.bluetooth.info("Forgot \(address.rawValue)")
+        let stillPaired = self.device(for: address)?.isPaired() ?? false
+        AppLog.bluetooth.info("forget \(address.rawValue) stillPaired=\(stillPaired)")
     }
 
     func pair(_ address: DeviceAddress) async throws {
-        begin()
-        guard !cancelled else { throw BluetoothError.failed("Stopped.") }
         guard let device = device(for: address) else {
+            AppLog.bluetooth.error("pair \(address.rawValue) no device record")
             throw BluetoothError.failed("\(address.rawValue) isn't available to pair.")
         }
-        if device.isPaired() { return }
-        let session = PairSession()
-        pairSession = session
-        defer { pairSession = nil }
-        try await session.pair(device)
+        if device.isPaired() {
+            AppLog.bluetooth.info("pair \(address.rawValue) already paired")
+            return
+        }
+        AppLog.bluetooth.info("pair \(address.rawValue) start")
+        try await run(PairSession()) { try await $0.pair(device) }
     }
 
     func waitUntilDiscovered(_ address: DeviceAddress, timeout: TimeInterval) async -> Bool {
-        begin()
-        let deadline = Date().addingTimeInterval(timeout)
-        while !cancelled && Date() < deadline {
-            let slice = min(8, deadline.timeIntervalSinceNow)
-            guard slice > 0 else { break }
-            if await runInquiry(matching: address, timeout: slice) {
-                return true
-            }
+        let started = epoch
+        let found = await run(InquirySession()) {
+            await $0.waitFor(address: address, timeout: timeout)
         }
-        return false
+        return found && !isCancelled(since: started)
     }
 
     func cancelOperations() {
-        cancelled = true
-        inquiry?.stop()
-        pairSession?.stop()
+        epoch += 1
+        for session in Array(sessions.values) {
+            session.stop()
+        }
+        AppLog.bluetooth.info("cancel bluetooth operations")
     }
 
-    func pairedDevices() throws -> [BTDevice] {
+    func pairedDevices() -> [BTDevice] {
         let list = IOBluetoothDevice.pairedDevices() as? [IOBluetoothDevice] ?? []
         return list.compactMap(makeDevice)
     }
 
-    func inquire(timeout: TimeInterval) async throws -> [BTDevice] {
-        begin()
-        let session = InquirySession()
-        inquiry = session
-        defer { inquiry = nil }
-        return await session.collect(timeout: timeout)
+    func inquire(timeout: TimeInterval) async -> [BTDevice] {
+        await run(InquirySession()) { await $0.collect(timeout: timeout) }
     }
 
-    private func runInquiry(matching address: DeviceAddress, timeout: TimeInterval) async -> Bool {
-        let session = InquirySession()
-        inquiry = session
-        defer { inquiry = nil }
-        return await session.waitFor(address: address, timeout: timeout)
+    /// Keeps `session` reachable by `cancelOperations` while `body` waits on it.
+    private func run<Session: BluetoothSession, T>(
+        _ session: Session,
+        _ body: @MainActor (Session) async throws -> T
+    ) async rethrows -> T {
+        let id = ObjectIdentifier(session)
+        sessions[id] = session
+        defer { sessions[id] = nil }
+        return try await body(session)
     }
 
-    private func pollConnected(_ device: IOBluetoothDevice, timeout: TimeInterval) async -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
-        while !cancelled && Date() < deadline {
-            if device.isConnected() { return true }
-            try? await Task.sleep(nanoseconds: 200_000_000)
-        }
-        return device.isConnected()
+    private func isCancelled(since started: Int) -> Bool {
+        epoch != started
     }
 
-    private func begin() {
-        cancelled = false
+    /// True when the baseband link is up and still up after a short settle.
+    private func held(_ device: IOBluetoothDevice, since started: Int) async -> Bool {
+        guard device.isConnected() else { return false }
+        try? await Task.sleep(nanoseconds: 400_000_000)
+        return !isCancelled(since: started) && device.isConnected()
     }
 
     private func device(for address: DeviceAddress) -> IOBluetoothDevice? {
@@ -238,152 +260,13 @@ final class IOBluetoothWork {
         let name = device.nameOrAddress ?? address
         return BTDevice(address: DeviceAddress(address), name: name)
     }
-}
 
-@MainActor
-private final class PairSession: NSObject {
-    private var continuation: CheckedContinuation<Void, Error>?
-    private var pairer: IOBluetoothDevicePair?
-    private var finished = false
-
-    func pair(_ device: IOBluetoothDevice) async throws {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            self.continuation = continuation
-            let pairer = IOBluetoothDevicePair(device: device)
-            pairer?.delegate = self
-            self.pairer = pairer
-            let result = pairer?.start() ?? kIOReturnError
-            if result != kIOReturnSuccess {
-                self.finish(.failure(BluetoothError.failed("Couldn't start pairing.")))
-            }
-        }
-    }
-
-    func stop() {
-        pairer?.stop()
-        finish(.failure(BluetoothError.failed("Stopped.")))
-    }
-
-    @objc nonisolated func devicePairingFinished(_ sender: Any!, error: IOReturn) {
-        let error = error
-        MainActor.assumeIsolated {
-            if error == kIOReturnSuccess {
-                self.finish(.success(()))
-            } else {
-                self.finish(.failure(BluetoothError.failed(String(format: "Pairing failed (0x%02x).", error))))
-            }
-        }
-    }
-
-    @objc nonisolated func devicePairingUserConfirmationRequest(_ sender: Any!, numericValue: UInt32) {
-        (sender as? IOBluetoothDevicePair)?.replyUserConfirmation(true)
-    }
-
-    @objc nonisolated func devicePairingPINCodeRequest(_ sender: Any!) {
-        var pin = BluetoothPINCode(data: (
-            0x30, 0x30, 0x30, 0x30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
-        ))
-        (sender as? IOBluetoothDevicePair)?.replyPINCode(4, pinCode: &pin)
-    }
-
-    private func finish(_ result: Result<Void, Error>) {
-        guard !finished else { return }
-        finished = true
-        continuation?.resume(with: result)
-        continuation = nil
-    }
-}
-
-@MainActor
-private final class InquirySession: NSObject {
-    private var continuation: CheckedContinuation<Bool, Never>?
-    private var listContinuation: CheckedContinuation<[BTDevice], Never>?
-    private var inquiry: IOBluetoothDeviceInquiry!
-    private var target: DeviceAddress?
-    private var finished = false
-    private var found: [BTDevice] = []
-
-    override init() {
-        super.init()
-        guard let inquiry = IOBluetoothDeviceInquiry(delegate: self) else { return }
-        inquiry.updateNewDeviceNames = false
-        inquiry.inquiryLength = 8
-        self.inquiry = inquiry
-    }
-
-    func waitFor(address: DeviceAddress, timeout: TimeInterval) async -> Bool {
-        target = address
-        return await run(timeout: timeout)
-    }
-
-    func collect(timeout: TimeInterval) async -> [BTDevice] {
-        let found = await withCheckedContinuation { (continuation: CheckedContinuation<[BTDevice], Never>) in
-            self.listContinuation = continuation
-            _ = self.runFlagged(timeout: timeout)
-        }
-        return found
-    }
-
-    func stop() {
-        inquiry.stop()
-        resume(false)
-    }
-
-    private func run(timeout: TimeInterval) async -> Bool {
-        await withCheckedContinuation { continuation in
-            self.continuation = continuation
-            _ = self.runFlagged(timeout: timeout)
-        }
-    }
-
-    private func runFlagged(timeout: TimeInterval) -> Bool {
-        let result = inquiry.start()
-        if result != kIOReturnSuccess {
-            resume(false)
-            return false
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + timeout) {
-            _ = MainActor.assumeIsolated {
-                self.inquiry.stop()
-            }
-        }
-        return true
-    }
-
-    private func resume(_ foundTarget: Bool) {
-        guard !finished else { return }
-        finished = true
-        continuation?.resume(returning: foundTarget)
-        continuation = nil
-        listContinuation?.resume(returning: found)
-        listContinuation = nil
-    }
-
-    private func consider(address rawAddress: String, name: String) {
-        let address = DeviceAddress(rawAddress)
-        if !found.contains(where: { $0.address == address }) {
-            found.append(BTDevice(address: address, name: name))
-        }
-        if let target, target == address {
-            inquiry?.stop()
-            resume(true)
-        }
-    }
-}
-
-extension InquirySession: IOBluetoothDeviceInquiryDelegate {
-    nonisolated func deviceInquiryDeviceFound(_ sender: IOBluetoothDeviceInquiry!, device: IOBluetoothDevice!) {
-        guard let device else { return }
-        let address = device.addressString ?? ""
-        let name = device.nameOrAddress ?? address
-        MainActor.assumeIsolated {
-            self.consider(address: address, name: name)
-        }
-    }
-
-    nonisolated func deviceInquiryComplete(_ sender: IOBluetoothDeviceInquiry!, error: IOReturn, aborted: Bool) {
-        MainActor.assumeIsolated {
-            self.resume(false)
+    /// IOBluetooth's cached levels. `batteryPercentSingle` reads 0 when it has
+    /// no level, which `BatteryLevel.choose` ignores.
+    private static func reportedBattery(_ device: IOBluetoothDevice) -> [Int] {
+        batteryKeys.compactMap { key in
+            guard device.responds(to: NSSelectorFromString(key)) else { return nil }
+            return (device.value(forKey: key) as? NSNumber)?.intValue
         }
     }
 }

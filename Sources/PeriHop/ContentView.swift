@@ -36,8 +36,9 @@ struct ContentView: View {
                 mainView(config: config)
             }
         }
-        .onAppear { model.menuVisible = true }
-        .onDisappear { model.menuVisible = false }
+        .onChange(of: showSettings) { _ in StatusMenu.shared.relayoutSoon() }
+        .onChange(of: showInfo) { _ in StatusMenu.shared.relayoutSoon() }
+        .onChange(of: showSetup) { _ in StatusMenu.shared.relayoutSoon() }
     }
 
     @ViewBuilder
@@ -89,15 +90,17 @@ struct ContentView: View {
                     Button("Stop") { model.handoff.stop() }
                 }
             } else {
-                Button("Use here") {
-                    model.bringHere(config.devices)
+                HStack {
+                    Button("Use here") {
+                        model.bringHere(config.devices)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .frame(maxWidth: .infinity)
+                    Button("Hand off") {
+                        model.sendAway(config.devices)
+                    }
+                    .frame(maxWidth: .infinity)
                 }
-                .buttonStyle(.borderedProminent)
-                .frame(maxWidth: .infinity)
-                Button("Hand off") {
-                    model.sendAway(config.devices)
-                }
-                .frame(maxWidth: .infinity)
             }
 
             Divider()
@@ -139,7 +142,7 @@ struct ContentView: View {
         case .pressKey(let name):
             return "Press a key on \(name), or click the trackpad."
         case .powerCycle(let name):
-            return "Turn \(name) off, then on. If it still doesn't appear, plug in its cable."
+            return "The other Mac is closed or asleep. Turn \(name) off and on now."
         }
     }
 
@@ -149,7 +152,8 @@ struct ContentView: View {
             HStack {
                 Text(device.name).font(.subheadline)
                 Spacer()
-                if let percent = model.batteries[device.address] {
+                if model.handoff.status(for: device.address) == .success,
+                   let percent = model.batteries[device.address] {
                     Text("\(percent)%")
                         .font(.caption)
                         .foregroundStyle(.secondary)

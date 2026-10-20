@@ -2,49 +2,57 @@ import CryptoKit
 import Foundation
 import Network
 
-/// Bonjour plus an optional manual address. Messages are sealed with a key
-/// derived from the code the user typed on both Macs.
+/// Moves messages to and from the other Mac. Bonjour or a manual address
+/// finds it; the pairing code authenticates it.
 final class PeerService: PeerLinking, @unchecked Sendable {
-    var onRequest: (@Sendable (PeerMessage) async -> PeerMessage?)?
-    var onIdentity: (@Sendable (_ fingerprint: String, _ trusted: Bool) -> Void)?
+    typealias RequestHandler = @Sendable (PeerMessage) async -> PeerMessage?
+    typealias IdentityHandler = @Sendable (_ fingerprint: String, _ trusted: Bool) -> Void
 
     private let engine = PeerEngine()
+    private let lock = NSLock()
+    private var requestHandler: RequestHandler?
+    private var identityHandler: IdentityHandler?
+    /// Start and stop calls apply in the order they were made.
+    private var lastChange: Task<Void, Never>?
+
+    var onRequest: RequestHandler? {
+        get { locked { requestHandler } }
+        set { locked { requestHandler = newValue } }
+    }
+
+    var onIdentity: IdentityHandler? {
+        get { locked { identityHandler } }
+        set { locked { identityHandler = newValue } }
+    }
 
     func start(code: String, manualHost: String?, pinnedFingerprint: String? = nil, learnedHost: String? = nil) {
-        let normalized = PairingCode.normalize(code)
-        guard normalized.count >= 8 else {
-            stop()
-            return
+        enqueue {
+            await self.configure(code: code, manualHost: manualHost, pinnedFingerprint: pinnedFingerprint, learnedHost: learnedHost)
         }
-        let key = PeerCrypto.deriveKey(code: normalized)
-        let fingerprint = PeerCrypto.fingerprint(code: normalized)
-        Task { [self] in
-            await engine.start(
-                key: key,
-                manualHost: manualHost,
-                fingerprint: fingerprint,
-                pinnedFingerprint: pinnedFingerprint,
-                learnedHost: learnedHost,
-                onRequest: { [weak self] message in
-                    await self?.onRequest?(message)
-                },
-                onIdentity: { [weak self] fingerprint, trusted in
-                    self?.onIdentity?(fingerprint, trusted)
-                }
-            )
-        }
+    }
+
+    func activate(code: String, manualHost: String?, pinnedFingerprint: String? = nil, learnedHost: String? = nil) async {
+        await enqueue {
+            await self.configure(code: code, manualHost: manualHost, pinnedFingerprint: pinnedFingerprint, learnedHost: learnedHost)
+        }.value
     }
 
     func stop() {
-        Task { await engine.stop() }
+        enqueue { [engine] in await engine.stop() }
     }
 
     func ping(timeout: TimeInterval) async -> Bool {
-        guard await engine.isConfigured else { return false }
+        guard await engine.isConfigured else {
+            await engine.noteReachable(false, detail: "no pairing code")
+            return false
+        }
         do {
             let reply = try await engine.request(PeerMessage(id: UUID(), type: "ping"), timeout: timeout)
-            return reply.type == "pong"
+            let ok = reply.type == "pong"
+            await engine.noteReachable(ok, detail: ok ? "" : "reply \(reply.type)")
+            return ok
         } catch {
+            await engine.noteReachable(false, detail: error.localizedDescription)
             return false
         }
     }
@@ -99,105 +107,250 @@ final class PeerService: PeerLinking, @unchecked Sendable {
             timeout: 3
         )
     }
+
+    private func configure(code: String, manualHost: String?, pinnedFingerprint: String?, learnedHost: String?) async {
+        let normalized = PairingCode.normalize(code)
+        guard normalized.count >= PairingCode.length else {
+            AppLog.peer.info("peer stopped, pairing code is too short")
+            await engine.stop()
+            return
+        }
+        let key = PeerCrypto.deriveKey(code: normalized)
+        let settings = PeerEngine.Settings(
+            fingerprint: PeerCrypto.fingerprint(key: key),
+            manualHost: manualHost,
+            pinnedFingerprint: pinnedFingerprint,
+            learnedHost: learnedHost
+        )
+        await engine.start(
+            key: key,
+            settings: settings,
+            onRequest: { [weak self] message in
+                await self?.onRequest?(message)
+            },
+            onIdentity: { [weak self] fingerprint, trusted in
+                self?.onIdentity?(fingerprint, trusted)
+            }
+        )
+    }
+
+    @discardableResult
+    private func enqueue(_ work: @escaping @Sendable () async -> Void) -> Task<Void, Never> {
+        locked {
+            let previous = lastChange
+            let task = Task {
+                await previous?.value
+                await work()
+            }
+            lastChange = task
+            return task
+        }
+    }
+
+    private func locked<T>(_ body: () -> T) -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return body()
+    }
 }
 
+/// Holds at most one link to the other Mac, matches replies to requests, and
+/// hands incoming requests to `onRequest` one at a time, in arrival order.
 private actor PeerEngine {
+    struct Settings: Equatable, Sendable {
+        var fingerprint: String
+        var manualHost: String?
+        var pinnedFingerprint: String?
+        var learnedHost: String?
+    }
+
+    private struct Pending {
+        let continuation: CheckedContinuation<PeerMessage, Error>
+        let timer: Task<Void, Never>
+        var socket: PeerSocket?
+    }
+
+    private struct Inbound: Sendable {
+        let message: PeerMessage
+        let socket: PeerSocket
+    }
+
+    private static let handshakeTimeout: TimeInterval = 6
+    private static let heartbeatInterval: UInt64 = 15_000_000_000
+
+    private let listener = PeerListener()
+    private var directory: PeerDirectory
     private var key: SymmetricKey?
-    private var manualHost: String?
-    private var learnedHost: String?
-    private var pinnedFingerprint: String?
-    private var fingerprint = ""
+    private var settings: Settings?
     private var limiter = HandshakeLimiter()
-    private var listener: NWListener?
     private var browser: NWBrowser?
-    private var results: Set<NWBrowser.Result> = []
     private var socket: PeerSocket?
+    private var dialing: Task<PeerSocket, Error>?
     private var receiveTask: Task<Void, Never>?
     private var heartbeat: Task<Void, Never>?
-    private var pendings: [UUID: PendingReply] = [:]
-    private var onRequest: (@Sendable (PeerMessage) async -> PeerMessage?)?
-    private var onIdentity: (@Sendable (String, Bool) -> Void)?
-    private let localName = Host.current().localizedName ?? ProcessInfo.processInfo.hostName
+    private var inbox: AsyncStream<Inbound>.Continuation?
+    private var pendings: [UUID: Pending] = [:]
+    private var onRequest: PeerService.RequestHandler?
+    private var onIdentity: PeerService.IdentityHandler?
+    private var announcedPeers: [String: Bool] = [:]
+    private var lastReachable: Bool?
+    /// Bumped by every start and stop; links finishing under an older value are dropped.
+    private var generation = 0
+
+    init() {
+        let name = Host.current().localizedName ?? ProcessInfo.processInfo.hostName
+        directory = PeerDirectory(localName: name, localInstance: UUID().uuidString)
+    }
 
     var isConfigured: Bool { key != nil }
 
     func start(
         key: SymmetricKey,
-        manualHost: String?,
-        fingerprint: String,
-        pinnedFingerprint: String?,
-        learnedHost: String?,
-        onRequest: @escaping @Sendable (PeerMessage) async -> PeerMessage?,
-        onIdentity: @escaping @Sendable (String, Bool) -> Void
-    ) {
-        stopListening()
-        self.key = key
-        self.manualHost = manualHost
-        self.fingerprint = fingerprint
-        self.pinnedFingerprint = pinnedFingerprint
-        self.learnedHost = learnedHost
+        settings: Settings,
+        onRequest: @escaping PeerService.RequestHandler,
+        onIdentity: @escaping PeerService.IdentityHandler
+    ) async {
         self.onRequest = onRequest
         self.onIdentity = onIdentity
-        let parameters = Self.parameters
-        do {
-            let listener = try NWListener(using: parameters, on: 47620)
-            let record = NWTXTRecord(["fp": fingerprint])
-            listener.service = NWListener.Service(name: localName, type: "_perihop._tcp", domain: nil, txtRecord: record)
-            listener.newConnectionHandler = { [weak self] connection in
-                Task { await self?.accept(connection) }
-            }
-            listener.stateUpdateHandler = { state in
-                if case .failed(let error) = state {
-                    AppLog.peer.error("Listener failed: \(error.localizedDescription)")
-                }
-            }
-            listener.start(queue: .global())
-            self.listener = listener
-        } catch {
-            AppLog.peer.error("Couldn't listen for the other Mac: \(error.localizedDescription)")
+        if settings == self.settings, await listener.isListening {
+            return
         }
+        await teardown()
+        self.key = key
+        self.settings = settings
+        directory.codeFingerprint = settings.fingerprint
+        directory.pinnedFingerprint = settings.pinnedFingerprint
+        AppLog.peer.info("listening name=\(directory.localName) manualHost=\(settings.manualHost ?? "-") pinned=\(settings.pinnedFingerprint != nil)")
+        startInbox()
+        await listener.start(
+            PeerListener.Advertisement(
+                name: directory.localName,
+                fingerprint: settings.fingerprint,
+                instance: directory.localInstance
+            )
+        ) { [weak self] connection in
+            Task { await self?.accept(connection) }
+        }
+        startBrowser()
+        startHeartbeat()
+    }
 
-        let browser = NWBrowser(for: .bonjour(type: "_perihop._tcp", domain: nil), using: parameters)
-        browser.browseResultsChangedHandler = { [weak self] results, _ in
-            Task { await self?.setResults(results) }
-        }
-        browser.start(queue: .global())
-        self.browser = browser
-        heartbeat = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 15_000_000_000)
-                await self?.sendHello()
-            }
+    func stop() async {
+        await teardown()
+    }
+
+    func noteReachable(_ ok: Bool, detail: String) {
+        guard lastReachable != ok else { return }
+        lastReachable = ok
+        if ok {
+            AppLog.peer.info("peer reachable")
+        } else {
+            AppLog.peer.error("peer unreachable: \(detail)")
         }
     }
 
-    func stop() {
-        stopListening()
-        key = nil
-    }
-
+    /// `timeout` covers dialing, the handshake, and the reply.
     func request(_ message: PeerMessage, timeout: TimeInterval) async throws -> PeerMessage {
-        let socket = try await ensureConnection()
-        let pending = PendingReply()
-        pendings[message.id] = pending
+        let loud = PeerTraffic.notable(message)
+        if loud {
+            AppLog.peer.info("out \(PeerTraffic.line(message))")
+        }
         do {
-            try await socket.send(message)
+            let reply = try await exchange(message, timeout: timeout)
+            if loud || PeerTraffic.notable(reply) {
+                AppLog.peer.info("ack \(PeerTraffic.line(reply))")
+            }
+            return reply
         } catch {
-            pendings[message.id] = nil
+            if loud || message.type == "hello" {
+                AppLog.peer.error("out \(message.type) \(message.address ?? "-") failed: \(error.localizedDescription)")
+            }
             throw error
         }
+    }
+
+    // MARK: Requests
+
+    private func exchange(_ message: PeerMessage, timeout: TimeInterval) async throws -> PeerMessage {
+        let id = message.id
         return try await withCheckedThrowingContinuation { continuation in
-            pending.attach(continuation)
-            let id = message.id
-            Task {
-                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-                self.expire(id)
+            let timer = Task {
+                try? await Task.sleep(nanoseconds: UInt64(max(0, timeout) * 1_000_000_000))
+                guard !Task.isCancelled else { return }
+                self.resolve(id, with: .failure(PeerError.timeout))
             }
+            pendings[id] = Pending(continuation: continuation, timer: timer)
+            Task { await self.deliver(message) }
         }
     }
 
-    private func expire(_ id: UUID) {
-        pendings.removeValue(forKey: id)?.resume(with: .failure(PeerError.timeout))
+    private func deliver(_ message: PeerMessage) async {
+        do {
+            let socket = try await connection()
+            guard pendings[message.id] != nil else { return }
+            pendings[message.id]?.socket = socket
+            try await socket.send(message)
+        } catch {
+            resolve(message.id, with: .failure(error))
+        }
+    }
+
+    private func resolve(_ id: UUID, with result: Result<PeerMessage, Error>) {
+        guard let pending = pendings.removeValue(forKey: id) else { return }
+        pending.timer.cancel()
+        pending.continuation.resume(with: result)
+    }
+
+    /// A reply can only come back on the link the request went out on.
+    private func failPendings(sentOn socket: PeerSocket) {
+        let ids = pendings.filter { $0.value.socket === socket }.map(\.key)
+        for id in ids {
+            resolve(id, with: .failure(PeerError.closed))
+        }
+    }
+
+    private func failAllPendings() {
+        for id in Array(pendings.keys) {
+            resolve(id, with: .failure(PeerError.closed))
+        }
+    }
+
+    // MARK: Links
+
+    /// Concurrent requests share one dial instead of racing to replace each other's link.
+    private func connection() async throws -> PeerSocket {
+        if let socket, socket.isOpen { return socket }
+        if let dialing { return try await dialing.value }
+        let task = Task { try await self.dial() }
+        dialing = task
+        defer { if dialing == task { dialing = nil } }
+        return try await task.value
+    }
+
+    private func dial() async throws -> PeerSocket {
+        guard let key else { throw PeerError.noCode }
+        guard let endpoint = resolveEndpoint() else { throw PeerError.unreachable }
+        let generation = self.generation
+        let socket = PeerSocket(connection: NWConnection(to: endpoint, using: PeerEndpoint.parameters), role: .client, key: key)
+        let host = socket.remoteHost
+        guard limiter.allow(host) else { throw PeerError.handshakeFailed }
+        do {
+            try await socket.open(timeout: Self.handshakeTimeout)
+        } catch {
+            if error as? PeerError == .handshakeFailed {
+                limiter.recordFailure(host)
+            }
+            AppLog.peer.error("outgoing link \(host) failed: \(error.localizedDescription)")
+            throw error
+        }
+        guard generation == self.generation else {
+            socket.cancel()
+            throw PeerError.closed
+        }
+        limiter.recordSuccess(host)
+        AppLog.peer.info("link up outgoing \(host)")
+        adopt(socket)
+        return socket
     }
 
     private func accept(_ connection: NWConnection) async {
@@ -205,105 +358,145 @@ private actor PeerEngine {
             connection.cancel()
             return
         }
-        let host = Self.remoteHost(connection)
+        let generation = self.generation
+        let socket = PeerSocket(connection: connection, role: .server, key: key)
+        let host = socket.remoteHost
         guard limiter.allow(host) else {
             AppLog.peer.error("Ignoring \(host) after repeated handshake failures")
             connection.cancel()
             return
         }
-        let socket = PeerSocket(connection: connection, role: .server, key: key)
         do {
-            try await socket.open()
-            limiter.recordSuccess(host)
-        } catch let error as PeerError where error == .handshakeFailed {
-            limiter.recordFailure(host)
-            AppLog.peer.error("Incoming link failed: \(error.localizedDescription)")
-            connection.cancel()
-            return
+            try await socket.open(timeout: Self.handshakeTimeout)
         } catch {
-            AppLog.peer.error("Incoming link failed: \(error.localizedDescription)")
-            connection.cancel()
+            // The server's answer already carries a MAC of the pairing code,
+            // so a client that takes it and hangs up counts as a failure too.
+            limiter.recordFailure(host)
+            AppLog.peer.error("incoming link \(host) failed: \(error.localizedDescription)")
             return
         }
-        adopt(socket)
-    }
-
-    private func ensureConnection() async throws -> PeerSocket {
-        if let socket, socket.isOpen { return socket }
-        guard let key else { throw PeerError.noCode }
-        guard let endpoint = resolveEndpoint() else { throw PeerError.unreachable }
-        let host = Self.remoteHost(endpoint)
-        guard limiter.allow(host) else { throw PeerError.handshakeFailed }
-        let connection = NWConnection(to: endpoint, using: Self.parameters)
-        let socket = PeerSocket(connection: connection, role: .client, key: key)
-        do {
-            try await socket.open()
-            limiter.recordSuccess(host)
-        } catch let error as PeerError where error == .handshakeFailed {
-            limiter.recordFailure(host)
-            connection.cancel()
-            throw error
-        } catch {
-            connection.cancel()
-            throw error
+        guard generation == self.generation else {
+            socket.cancel()
+            return
         }
+        limiter.recordSuccess(host)
+        AppLog.peer.info("link up incoming \(host)")
         adopt(socket)
-        return socket
     }
 
     private func adopt(_ socket: PeerSocket) {
         receiveTask?.cancel()
-        self.socket?.cancel()
+        if let old = self.socket, old !== socket {
+            old.cancel()
+            failPendings(sentOn: old)
+        }
         self.socket = socket
         receiveTask = Task { await self.receiveLoop(socket) }
     }
 
     private func receiveLoop(_ socket: PeerSocket) async {
         while !Task.isCancelled {
+            let message: PeerMessage
             do {
-                let message = try await socket.receive()
-                if let pending = pendings.removeValue(forKey: message.id) {
-                    pending.resume(with: .success(message))
-                    continue
-                }
-                if let reply = await onRequest?(message) {
-                    try await socket.send(reply)
-                }
+                message = try await socket.receive()
             } catch {
+                AppLog.peer.info("link down: \(error.localizedDescription)")
                 break
             }
+            if pendings[message.id] != nil {
+                resolve(message.id, with: .success(message))
+            } else {
+                inbox?.yield(Inbound(message: message, socket: socket))
+            }
         }
+        socket.cancel()
+        failPendings(sentOn: socket)
         if self.socket === socket {
             self.socket = nil
         }
     }
 
-    private func resolveEndpoint() -> NWEndpoint? {
-        if let manualHost, let endpoint = Self.endpoint(from: manualHost) {
-            return endpoint
-        }
-        if let learnedHost, let endpoint = Self.endpoint(from: learnedHost) {
-            return endpoint
-        }
-        for result in results {
-            if case let .service(name, _, _, _) = result.endpoint, name == localName {
-                continue
+    /// Runs requests from the other Mac in order, off the receive loop, so a
+    /// slow handler never holds up replies to this Mac's own requests.
+    private func startInbox() {
+        guard inbox == nil else { return }
+        let (stream, continuation) = AsyncStream.makeStream(of: Inbound.self)
+        inbox = continuation
+        Task { [weak self] in
+            for await inbound in stream {
+                await self?.handle(inbound)
             }
-            return result.endpoint
         }
-        return nil
     }
 
-    private func setResults(_ results: Set<NWBrowser.Result>) {
-        self.results = results
-        for result in results {
-            if case let .service(name, _, _, _) = result.endpoint, name == localName {
-                continue
+    private func handle(_ inbound: Inbound) async {
+        let message = inbound.message
+        let notable = PeerTraffic.notable(message)
+        if notable {
+            AppLog.peer.info("in \(PeerTraffic.line(message))")
+        }
+        guard let reply = await onRequest?(message) else {
+            if notable {
+                AppLog.peer.error("in \(message.type) \(message.address ?? "-") ignored")
             }
-            guard case .bonjour(let record) = result.metadata else { continue }
-            guard let advertised = record["fp"], !advertised.isEmpty else { continue }
-            let trusted = pinnedFingerprint == nil || pinnedFingerprint == advertised
-            onIdentity?(advertised, trusted)
+            return
+        }
+        if PeerTraffic.notable(reply) {
+            AppLog.peer.info("out \(PeerTraffic.line(reply))")
+        }
+        do {
+            try await inbound.socket.send(reply)
+        } catch {
+            AppLog.peer.error("reply \(reply.type) failed: \(error.localizedDescription)")
+        }
+    }
+
+    // MARK: Discovery
+
+    private func resolveEndpoint() -> NWEndpoint? {
+        if let host = settings?.manualHost, let endpoint = PeerEndpoint.endpoint(from: host) {
+            return endpoint
+        }
+        if let host = settings?.learnedHost, let endpoint = PeerEndpoint.endpoint(from: host) {
+            return endpoint
+        }
+        return directory.dialable
+    }
+
+    private func startBrowser() {
+        let generation = self.generation
+        let browser = NWBrowser(for: .bonjour(type: PeerListener.serviceType, domain: nil), using: PeerEndpoint.parameters)
+        browser.browseResultsChangedHandler = { [weak self] results, _ in
+            let sightings = results.compactMap(PeerSighting.init)
+            Task { await self?.see(sightings, generation: generation) }
+        }
+        browser.start(queue: .global())
+        self.browser = browser
+    }
+
+    private func see(_ sightings: [PeerSighting], generation: Int) {
+        guard generation == self.generation else { return }
+        directory.update(sightings)
+        let trust = directory.trustByName
+        for (name, trusted) in trust where announcedPeers[name] != trusted {
+            AppLog.peer.info("peer \(name) trusted=\(trusted)")
+        }
+        for name in announcedPeers.keys where trust[name] == nil {
+            AppLog.peer.info("peer \(name) gone")
+        }
+        announcedPeers = trust
+        if let identity = directory.identity {
+            onIdentity?(identity.fingerprint, identity.trusted)
+        }
+    }
+
+    private func startHeartbeat() {
+        heartbeat = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: Self.heartbeatInterval)
+                guard !Task.isCancelled else { return }
+                await self?.sendHello()
+            }
         }
     }
 
@@ -313,258 +506,24 @@ private actor PeerEngine {
         _ = try? await request(message, timeout: 3)
     }
 
-    private func stopListening() {
+    /// Clears the key first so nothing accepted during the awaits below uses it.
+    private func teardown() async {
+        generation += 1
+        key = nil
+        settings = nil
         heartbeat?.cancel()
         heartbeat = nil
+        browser?.cancel()
+        browser = nil
+        directory.clear()
+        announcedPeers = [:]
+        dialing?.cancel()
+        dialing = nil
         receiveTask?.cancel()
         receiveTask = nil
         socket?.cancel()
         socket = nil
-        listener?.cancel()
-        listener = nil
-        browser?.cancel()
-        browser = nil
-        results = []
-        for pending in pendings.values {
-            pending.resume(with: .failure(PeerError.closed))
-        }
-        pendings = [:]
-    }
-
-    private static func remoteHost(_ connection: NWConnection) -> String {
-        remoteHost(connection.endpoint)
-    }
-
-    private static func remoteHost(_ endpoint: NWEndpoint) -> String {
-        if case let .hostPort(host, _) = endpoint {
-            return "\(host)"
-        }
-        return String(describing: endpoint)
-    }
-
-    private static var parameters: NWParameters {
-        let parameters = NWParameters.tcp
-        parameters.includePeerToPeer = true
-        return parameters
-    }
-
-    private static func endpoint(from host: String) -> NWEndpoint? {
-        let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        let parts = trimmed.split(separator: ":", maxSplits: 1).map(String.init)
-        let portValue = parts.count == 2 ? UInt16(parts[1]) ?? 47620 : 47620
-        guard let port = NWEndpoint.Port(rawValue: portValue) else { return nil }
-        return .hostPort(host: NWEndpoint.Host(parts[0]), port: port)
-    }
-}
-
-private final class PendingReply: @unchecked Sendable {
-    private let lock = NSLock()
-    private var continuation: CheckedContinuation<PeerMessage, Error>?
-    private var result: Result<PeerMessage, Error>?
-
-    func attach(_ continuation: CheckedContinuation<PeerMessage, Error>) {
-        lock.lock()
-        defer { lock.unlock() }
-        if let result {
-            continuation.resume(with: result)
-        } else {
-            self.continuation = continuation
-        }
-    }
-
-    func resume(with result: Result<PeerMessage, Error>) {
-        lock.lock()
-        defer { lock.unlock() }
-        if let continuation {
-            self.continuation = nil
-            self.result = result
-            continuation.resume(with: result)
-        } else if self.result == nil {
-            self.result = result
-        }
-    }
-}
-
-private final class PeerSocket: @unchecked Sendable {
-    enum Role { case client, server }
-
-    let connection: NWConnection
-    private let role: Role
-    private let key: SymmetricKey
-    private var sessionKey: SymmetricKey?
-    private var buffer = Data()
-    private let lock = NSLock()
-    private(set) var isOpen = false
-
-    init(connection: NWConnection, role: Role, key: SymmetricKey) {
-        self.connection = connection
-        self.role = role
-        self.key = key
-    }
-
-    func open() async throws {
-        try await waitReady()
-        switch role {
-        case .client:
-            let hello = PeerCrypto.clientHello()
-            try await sendRaw(hello.packet)
-            let response = try await read(67)
-            let finished = try PeerCrypto.clientFinish(serverPacket: response, clientNonce: hello.nonce, key: key)
-            try await sendRaw(finished.packet)
-            sessionKey = finished.session
-        case .server:
-            let hello = try await read(35)
-            let response = try PeerCrypto.serverRespond(clientPacket: hello, key: key)
-            try await sendRaw(response.packet)
-            let auth = try await read(35)
-            let clientNonce = hello.subdata(in: 3..<35)
-            sessionKey = try PeerCrypto.serverFinish(
-                clientAuth: auth,
-                clientNonce: clientNonce,
-                serverNonce: response.nonce,
-                key: key
-            )
-        }
-        isOpen = true
-    }
-
-    func cancel() {
-        isOpen = false
-        connection.cancel()
-    }
-
-    func send(_ message: PeerMessage) async throws {
-        guard let sessionKey else { throw PeerError.closed }
-        let sealed = try PeerCrypto.seal(message, key: sessionKey)
-        var length = UInt32(sealed.count).bigEndian
-        var packet = Data(bytes: &length, count: 4)
-        packet.append(sealed)
-        try await sendRaw(packet)
-    }
-
-    func receive() async throws -> PeerMessage {
-        guard let sessionKey else { throw PeerError.closed }
-        let lengthData = try await read(4)
-        let length = lengthData.withUnsafeBytes { $0.load(as: UInt32.self).bigEndian }
-        guard length > 0, length < 1_000_000 else { throw PeerError.closed }
-        let sealed = try await read(Int(length))
-        return try PeerCrypto.open(sealed, key: sessionKey)
-    }
-
-    private func waitReady() async throws {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            let gate = ResumeOnce()
-            connection.stateUpdateHandler = { state in
-                switch state {
-                case .ready:
-                    gate.run { continuation.resume() }
-                case .failed(let error):
-                    gate.run { continuation.resume(throwing: error) }
-                case .cancelled:
-                    gate.run { continuation.resume(throwing: PeerError.unreachable) }
-                default:
-                    break
-                }
-            }
-            connection.start(queue: .global())
-        }
-    }
-
-    private func sendRaw(_ data: Data) async throws {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            connection.send(content: data, completion: .contentProcessed { error in
-                if let error {
-                    continuation.resume(throwing: error)
-                } else {
-                    continuation.resume()
-                }
-            })
-        }
-    }
-
-    private func read(_ count: Int) async throws -> Data {
-        while bufferedCount() < count {
-            let chunk = try await receiveChunk()
-            guard !chunk.isEmpty else { throw PeerError.closed }
-            append(chunk)
-        }
-        return take(count)
-    }
-
-    private func receiveChunk() async throws -> Data {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
-            connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { data, _, isComplete, error in
-                if let error {
-                    continuation.resume(throwing: error)
-                    return
-                }
-                if let data, !data.isEmpty {
-                    continuation.resume(returning: data)
-                    return
-                }
-                if isComplete {
-                    continuation.resume(returning: Data())
-                    return
-                }
-                continuation.resume(returning: Data())
-            }
-        }
-    }
-
-    private func bufferedCount() -> Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return buffer.count
-    }
-
-    private func append(_ data: Data) {
-        lock.lock()
-        buffer.append(data)
-        lock.unlock()
-    }
-
-    private func take(_ count: Int) -> Data {
-        lock.lock()
-        defer { lock.unlock() }
-        let data = buffer.prefix(count)
-        buffer.removeFirst(count)
-        return Data(data)
-    }
-}
-
-private final class ResumeOnce: @unchecked Sendable {
-    private let lock = NSLock()
-    private var done = false
-
-    func run(_ body: () -> Void) {
-        lock.lock()
-        defer { lock.unlock() }
-        guard !done else { return }
-        done = true
-        body()
-    }
-}
-
-enum LocalAddress {
-    static func ipv4() -> String? {
-        var pointer: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&pointer) == 0, let first = pointer else { return nil }
-        defer { freeifaddrs(first) }
-        var cursor: UnsafeMutablePointer<ifaddrs>? = first
-        while let current = cursor {
-            defer { cursor = current.pointee.ifa_next }
-            let flags = Int32(current.pointee.ifa_flags)
-            guard flags & IFF_LOOPBACK == 0, let address = current.pointee.ifa_addr else { continue }
-            guard address.pointee.sa_family == UInt8(AF_INET) else { continue }
-            let name = String(cString: current.pointee.ifa_name)
-            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-            let status = getnameinfo(address, socklen_t(address.pointee.sa_len), &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST)
-            guard status == 0 else { continue }
-            let bytes = host.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
-            let value = String(decoding: bytes, as: UTF8.self)
-            if name == "en0" || name == "en1" { return value }
-        }
-        return nil
+        failAllPendings()
+        await listener.stop()
     }
 }

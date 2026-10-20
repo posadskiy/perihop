@@ -111,6 +111,20 @@ final class HotkeyCenter: @unchecked Sendable {
     }
 }
 
+struct DockDisplay: Identifiable, Equatable, Sendable {
+    var id: String
+    var name: String
+
+    /// External displays only. The built-in panel is not a dock target.
+    static func listed(from candidates: [(id: String, builtin: Bool, name: String)]) -> [DockDisplay] {
+        candidates.compactMap { candidate in
+            guard !candidate.builtin, !candidate.id.isEmpty else { return nil }
+            let trimmed = candidate.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            return DockDisplay(id: candidate.id, name: trimmed.isEmpty ? "Display" : trimmed)
+        }
+    }
+}
+
 final class DisplayWatcher: @unchecked Sendable {
     var onAdded: (@Sendable (String) -> Void)?
 
@@ -118,17 +132,36 @@ final class DisplayWatcher: @unchecked Sendable {
         let pointer = Unmanaged.passUnretained(self).toOpaque()
         CGDisplayRegisterReconfigurationCallback({ display, flags, user in
             guard let user, flags.contains(.addFlag) else { return }
+            guard !DisplayWatcher.isBuiltin(display) else { return }
             let watcher = Unmanaged<DisplayWatcher>.fromOpaque(user).takeUnretainedValue()
             guard let id = DisplayWatcher.uuid(for: display) else { return }
             watcher.onAdded?(id)
         }, pointer)
     }
 
-    static func online() -> [String] {
+    static func externalOnline() -> [DockDisplay] {
         var ids = [CGDirectDisplayID](repeating: 0, count: 16)
         var count: UInt32 = 0
         guard CGGetOnlineDisplayList(16, &ids, &count) == .success else { return [] }
-        return ids.prefix(Int(count)).compactMap { uuid(for: $0) }
+        let candidates = ids.prefix(Int(count)).compactMap { display -> (id: String, builtin: Bool, name: String)? in
+            guard let id = uuid(for: display) else { return nil }
+            return (id, isBuiltin(display), name(for: display))
+        }
+        return DockDisplay.listed(from: candidates)
+    }
+
+    private static func isBuiltin(_ display: CGDirectDisplayID) -> Bool {
+        CGDisplayIsBuiltin(display) != 0
+    }
+
+    private static func name(for display: CGDirectDisplayID) -> String {
+        let match = NSScreen.screens.first { screen in
+            guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
+                return false
+            }
+            return CGDirectDisplayID(number.uint32Value) == display
+        }
+        return match?.localizedName ?? ""
     }
 
     static func uuid(for display: CGDirectDisplayID) -> String? {

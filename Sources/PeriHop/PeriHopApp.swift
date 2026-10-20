@@ -1,16 +1,25 @@
+import AppKit
 import SwiftUI
 
 @main
 struct PeriHopApp: App {
-    @StateObject private var model = AppModel()
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     var body: some Scene {
-        MenuBarExtra {
-            ContentView()
-                .environmentObject(model)
-        } label: {
-            Image(systemName: model.menuSymbol)
+        // SwiftUI's menu bar window draws no icon and turns transparent when its content
+        // changes size. The status item in StatusMenu owns the panel and keeps it under the icon.
+        MenuBarExtra("PeriHop", isInserted: .constant(false)) {
+            EmptyView()
         }
-        .menuBarExtraStyle(.window)
+    }
+}
+
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    let model = AppModel()
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.accessory)
+        StatusMenu.shared.start(model: model)
     }
 }

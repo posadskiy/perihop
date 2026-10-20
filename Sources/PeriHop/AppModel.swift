@@ -12,6 +12,7 @@ final class AppModel: ObservableObject {
     @Published var pairingCode: String
     @Published var peerHost: String
     @Published var pairingCodeError: String?
+    @Published private(set) var isPairing = false
     @Published private(set) var peerReachable = false
     @Published private(set) var trustMismatch = false
     @Published private(set) var offeredFingerprint = ""
@@ -29,6 +30,9 @@ final class AppModel: ObservableObject {
     private var usb: USBAccessoryWatcher?
     private var sleepObservers: [NSObjectProtocol] = []
     private var cancellables: Set<AnyCancellable> = []
+    /// Code this Mac is listening with before the link is confirmed.
+    private var listeningCode = ""
+    private var offeredCode = ""
 
     var menuSymbol: String {
         if pairingCode.isEmpty || trustMismatch { return "exclamationmark.triangle" }
@@ -77,7 +81,7 @@ final class AppModel: ObservableObject {
             self?.objectWillChange.send()
         }.store(in: &cancellables)
 
-        if UserDefaults.standard.string(forKey: "pinnedFingerprint") == nil, pairingCode.count >= 8 {
+        if UserDefaults.standard.string(forKey: "pinnedFingerprint") == nil, pairingCode.count >= PairingCode.length {
             UserDefaults.standard.set(PeerCrypto.fingerprint(code: pairingCode), forKey: "pinnedFingerprint")
         }
         restartPeer()
@@ -117,26 +121,83 @@ final class AppModel: ObservableObject {
         urls.start()
     }
 
-    func savePairing(code: String, host: String) {
-        let normalized = PairingCode.normalize(code)
-        if !normalized.isEmpty && normalized.count < 8 {
-            pairingCodeError = "Use at least 8 characters, or generate a code."
-            return
+    /// Shows a code and listens for the other Mac. The link is saved only after both sides talk.
+    func prepareOffer() -> String {
+        if !pairingCode.isEmpty { return pairingCode }
+        if offeredCode.count < PairingCode.length {
+            offeredCode = PairingCode.generate()
         }
-        do {
-            try KeychainStore.saveCode(normalized)
-            pairingCode = normalized
-            peerHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
-            UserDefaults.standard.set(peerHost, forKey: "peerHost")
-            if normalized.count >= 8 {
-                UserDefaults.standard.set(PeerCrypto.fingerprint(code: normalized), forKey: "pinnedFingerprint")
-                trustMismatch = false
+        listen(offeredCode)
+        return offeredCode
+    }
+
+    func refreshOffer() -> String {
+        offeredCode = PairingCode.generate()
+        pairingCodeError = nil
+        listen(offeredCode)
+        return offeredCode
+    }
+
+    func pair(code: String, host: String) async -> Bool {
+        let normalized = PairingCode.normalize(code)
+        guard normalized.count >= PairingCode.length else {
+            pairingCodeError = "Enter the \(PairingCode.length)-character code from the other Mac."
+            return false
+        }
+        isPairing = true
+        defer { isPairing = false }
+        pairingCodeError = nil
+        let trimmedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        listeningCode = normalized
+        offeredCode = normalized
+        await peer.activate(
+            code: normalized,
+            manualHost: trimmedHost.isEmpty ? nil : trimmedHost,
+            pinnedFingerprint: nil,
+            learnedHost: nil
+        )
+        for attempt in 1...4 {
+            AppLog.peer.info("pair attempt \(attempt)")
+            if await peer.ping(timeout: 2.5) {
+                do {
+                    try persistLink(code: normalized, host: trimmedHost)
+                    AppLog.peer.info("pair confirmed from this Mac")
+                    return true
+                } catch {
+                    pairingCodeError = error.localizedDescription
+                    return false
+                }
             }
+        }
+        pairingCodeError = "Couldn't reach the other Mac. Leave its code on screen and try again."
+        return false
+    }
+
+    func unpair() async {
+        do {
+            try KeychainStore.saveCode("")
+            pairingCode = ""
+            offeredCode = ""
+            listeningCode = ""
+            peerHost = ""
+            UserDefaults.standard.set("", forKey: "peerHost")
+            UserDefaults.standard.removeObject(forKey: "pinnedFingerprint")
+            UserDefaults.standard.removeObject(forKey: "learnedPeerHost")
+            trustMismatch = false
+            offeredFingerprint = ""
             pairingCodeError = nil
-            restartPeer()
+            await peer.activate(code: "", manualHost: nil, pinnedFingerprint: nil, learnedHost: nil)
         } catch {
             pairingCodeError = error.localizedDescription
         }
+    }
+
+    func updatePeerHost(_ host: String) {
+        let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed != peerHost else { return }
+        peerHost = trimmed
+        UserDefaults.standard.set(peerHost, forKey: "peerHost")
+        restartPeer()
     }
 
     func refreshPeer() async {
@@ -210,6 +271,9 @@ final class AppModel: ObservableObject {
     private func reply(to message: PeerMessage) async -> PeerMessage? {
         switch message.type {
         case "ping":
+            if pairingCode.isEmpty {
+                acceptIncomingLink()
+            }
             return message.reply(type: "pong")
         case "claims":
             let stamps = handoff.integrateClaims(message.stamps ?? [])
@@ -217,8 +281,8 @@ final class AppModel: ObservableObject {
         case "release":
             guard let raw = message.address else { return nil }
             let address = DeviceAddress(raw)
-            await handoff.handleRemoteRelease(address, forget: message.forget ?? false)
-            return message.reply(type: "released")
+            let released = await handoff.handleRemoteRelease(address, forget: message.forget ?? false)
+            return message.reply(type: released ? "released" : "busy")
         case "owned":
             guard let raw = message.address else { return nil }
             let address = DeviceAddress(raw)
@@ -258,6 +322,41 @@ final class AppModel: ObservableObject {
         } catch {
             AppLog.config.error("Failed to save config: \(error.localizedDescription)")
         }
+    }
+
+    private func listen(_ code: String) {
+        let normalized = PairingCode.normalize(code)
+        listeningCode = normalized
+        peer.start(
+            code: normalized,
+            manualHost: peerHost.isEmpty ? nil : peerHost,
+            pinnedFingerprint: nil,
+            learnedHost: nil
+        )
+    }
+
+    /// The other Mac completed the handshake and pinged us, so this side is linked too.
+    private func acceptIncomingLink() {
+        guard pairingCode.isEmpty else { return }
+        guard listeningCode.count >= PairingCode.length else { return }
+        do {
+            try persistLink(code: listeningCode, host: peerHost)
+            AppLog.peer.info("pair confirmed from the other Mac")
+        } catch {
+            pairingCodeError = error.localizedDescription
+        }
+    }
+
+    private func persistLink(code: String, host: String) throws {
+        let normalized = PairingCode.normalize(code)
+        try KeychainStore.saveCode(normalized)
+        pairingCode = normalized
+        offeredCode = normalized
+        peerHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        UserDefaults.standard.set(peerHost, forKey: "peerHost")
+        UserDefaults.standard.set(PeerCrypto.fingerprint(code: normalized), forKey: "pinnedFingerprint")
+        trustMismatch = false
+        pairingCodeError = nil
     }
 
     private func restartPeer() {

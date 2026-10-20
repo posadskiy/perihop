@@ -13,20 +13,29 @@ actor MockBluetoothController: BluetoothControlling {
     var connected: Set<DeviceAddress> = []
     var paired: Set<DeviceAddress> = []
     var connectResults: [DeviceAddress: [Bool]] = [:]
+    var refused: Set<DeviceAddress> = []
     var discoverResults: [DeviceAddress: [Bool]] = [:]
     var pairError: Error?
+    var failDisconnect = false
 
     func disconnect(_ address: DeviceAddress, timeout: TimeInterval) async throws {
         disconnects.append(address)
+        if failDisconnect {
+            throw BluetoothError.failed("Couldn't disconnect \(address.rawValue).")
+        }
         connected.remove(address)
     }
 
-    func connect(_ address: DeviceAddress, timeout: TimeInterval) async -> Bool {
+    func connect(_ address: DeviceAddress, timeout: TimeInterval) async -> LinkResult {
         connects.append(address)
+        if refused.contains(address) { return .refused }
         let scripted = connectResults[address] ?? []
         let result = scripted.isEmpty ? connected.contains(address) : scripted[min(connects.filter { $0 == address }.count - 1, scripted.count - 1)]
-        if result { connected.insert(address) }
-        return result
+        if result {
+            connected.insert(address)
+            return .connected
+        }
+        return .absent
     }
 
     func isConnected(_ address: DeviceAddress) async -> Bool {
@@ -83,10 +92,12 @@ actor MockPeer: PeerLinking {
     private(set) var rollbacks: [DeviceAddress] = []
     private(set) var sleeping: [DeviceAddress] = []
     var remoteClaims: [ClaimStamp] = []
+    var failRelease = false
 
     func ping(timeout: TimeInterval) async -> Bool { reachable }
 
     func requestRelease(_ address: DeviceAddress, forget: Bool, timeout: TimeInterval) async throws {
+        if failRelease { throw PeerError.closed }
         releases.append((address, forget))
     }
 

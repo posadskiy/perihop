@@ -11,6 +11,7 @@ struct HandoffCoordinatorTests {
         let bluetooth = MockBluetoothController()
         let peer = MockPeer()
         await bluetooth.setConnectResults([true], for: keyboard.address)
+        await bluetooth.setPaired([keyboard.address])
         let coordinator = coordinator(bluetooth: bluetooth, peer: peer)
 
         coordinator.useHere(devices: [keyboard])
@@ -19,11 +20,30 @@ struct HandoffCoordinatorTests {
         let releases = await peer.releases
         #expect(releases.count == 1)
         #expect(releases.first?.0 == keyboard.address)
-        #expect(releases.first?.1 == false)
+        #expect(releases.first?.1 == true)
         #expect(await bluetooth.forgotten.isEmpty)
         #expect(await bluetooth.pairs.isEmpty)
         #expect(await peer.owned == [keyboard.address])
         #expect(coordinator.status(for: keyboard.address) == .success)
+    }
+
+    @Test func rejectedLinkKeyIsNotShownAsConnected() async throws {
+        let bluetooth = MockBluetoothController()
+        let peer = MockPeer()
+        await bluetooth.setRefused(keyboard.address)
+        await bluetooth.setDiscoverResults([false], for: keyboard.address)
+        await bluetooth.setPaired([keyboard.address])
+        let coordinator = coordinator(bluetooth: bluetooth, peer: peer)
+
+        coordinator.useHere(devices: [keyboard])
+        try await waitUntil { coordinator.activity == .finished }
+
+        #expect(await bluetooth.forgotten == [keyboard.address])
+        #expect(await bluetooth.pairs.isEmpty)
+        #expect(await peer.failed.isEmpty)
+        #expect(await peer.owned.isEmpty)
+        #expect(await peer.rollbacks == [keyboard.address])
+        #expect(coordinator.status(for: keyboard.address) == .failure("Couldn't reach Magic Keyboard. Turn it off and on, then try again."))
     }
 
     @Test func useHereRepairsWhenConnectIsRefused() async throws {
@@ -31,6 +51,7 @@ struct HandoffCoordinatorTests {
         let peer = MockPeer()
         await bluetooth.setConnectResults([false, false, true], for: keyboard.address)
         await bluetooth.setDiscoverResults([true], for: keyboard.address)
+        await bluetooth.setPaired([keyboard.address])
         let coordinator = coordinator(bluetooth: bluetooth, peer: peer)
         var saved: [DeviceEntry] = []
         coordinator.onDevicesChanged = { saved = $0 }
@@ -38,10 +59,53 @@ struct HandoffCoordinatorTests {
         coordinator.useHere(devices: [keyboard])
         try await waitUntil { coordinator.activity == .finished }
 
-        #expect(await peer.failed == [keyboard.address])
+        #expect(await peer.failed.isEmpty)
         #expect(await bluetooth.pairs == [keyboard.address])
+        let releases = await peer.releases
+        #expect(releases.count == 1)
+        #expect(releases.first?.0 == keyboard.address)
+        #expect(releases.first?.1 == true)
         #expect(saved.first?.bondMode == .single)
         #expect(coordinator.status(for: keyboard.address) == .success)
+    }
+
+    @Test func singleBondIsForgottenOnlyAfterItAppears() async throws {
+        var single = keyboard
+        single.bondMode = .single
+        let bluetooth = MockBluetoothController()
+        let peer = MockPeer()
+        await bluetooth.setConnectResults([true], for: keyboard.address)
+        await bluetooth.setDiscoverResults([true], for: keyboard.address)
+        let coordinator = coordinator(bluetooth: bluetooth, peer: peer)
+
+        coordinator.useHere(devices: [single])
+        try await waitUntil { coordinator.activity == .finished }
+
+        let releases = await peer.releases
+        #expect(releases.count == 1)
+        #expect(releases.first?.1 == true)
+        #expect(await bluetooth.pairs == [keyboard.address])
+        #expect(coordinator.status(for: keyboard.address) == .success)
+    }
+
+    @Test func missedSearchDoesNotForgetTheOtherMac() async throws {
+        var single = keyboard
+        single.bondMode = .single
+        let bluetooth = MockBluetoothController()
+        let peer = MockPeer()
+        await bluetooth.setConnectResults([false], for: keyboard.address)
+        await bluetooth.setDiscoverResults([false], for: keyboard.address)
+        let coordinator = coordinator(bluetooth: bluetooth, peer: peer)
+
+        coordinator.useHere(devices: [single])
+        try await waitUntil { coordinator.activity == .finished }
+
+        let releases = await peer.releases
+        #expect(releases.count == 1)
+        #expect(releases.first?.1 == true)
+        #expect(await bluetooth.pairs.isEmpty)
+        #expect(await peer.rollbacks == [keyboard.address])
+        #expect(coordinator.status(for: keyboard.address) == .failure("Couldn't reach Magic Keyboard. Turn it off and on, then try again."))
     }
 
     @Test func sleepingPeerIsTakenDirectly() async throws {
@@ -49,6 +113,7 @@ struct HandoffCoordinatorTests {
         let peer = MockPeer()
         await peer.setReachable(false)
         await bluetooth.setConnectResults([true], for: keyboard.address)
+        await bluetooth.setPaired([keyboard.address])
         let coordinator = coordinator(bluetooth: bluetooth, peer: peer)
 
         coordinator.useHere(devices: [keyboard])
@@ -60,7 +125,7 @@ struct HandoffCoordinatorTests {
         #expect(coordinator.peerReachable == false)
     }
 
-    @Test func failureRollsBackAfterAPowerCycleWindow() async throws {
+    @Test func failureRollsBackWhenTheAccessoryNeverAppears() async throws {
         let bluetooth = MockBluetoothController()
         let peer = MockPeer()
         await bluetooth.setConnectResults([false], for: keyboard.address)
@@ -97,12 +162,70 @@ struct HandoffCoordinatorTests {
     @Test func remoteReleaseCanForget() async {
         let bluetooth = MockBluetoothController()
         let coordinator = coordinator(bluetooth: bluetooth, peer: MockPeer())
+        var owned = keyboard
+        owned.holder = .thisMac
+        coordinator.useDevices([owned])
+        var saved: [DeviceEntry] = []
+        coordinator.onDevicesChanged = { saved = $0 }
 
-        await coordinator.handleRemoteRelease(keyboard.address, forget: true)
+        let released = await coordinator.handleRemoteRelease(keyboard.address, forget: true)
 
+        #expect(released)
         #expect(await bluetooth.disconnects == [keyboard.address])
         #expect(await bluetooth.forgotten == [keyboard.address])
-        #expect(await bluetooth.suppressions == [keyboard.address])
+        #expect(await bluetooth.suppressions.isEmpty)
+        #expect(saved.first?.holder == .otherMac)
+        #expect(saved.first?.bondMode == .single)
+    }
+
+    @Test func remoteReleaseStaysPutWhenDisconnectFails() async {
+        let bluetooth = MockBluetoothController()
+        await bluetooth.setFailDisconnect(true)
+        let coordinator = coordinator(bluetooth: bluetooth, peer: MockPeer())
+        var owned = keyboard
+        owned.holder = .thisMac
+        coordinator.useDevices([owned])
+        var saved: [DeviceEntry] = []
+        coordinator.onDevicesChanged = { saved = $0 }
+
+        let released = await coordinator.handleRemoteRelease(keyboard.address, forget: false)
+
+        #expect(!released)
+        #expect(await bluetooth.suppressions.isEmpty)
+        #expect(saved.isEmpty)
+    }
+
+    @Test func remoteReleaseDoesNotPageTheAccessoryBack() async throws {
+        let bluetooth = MockBluetoothController()
+        let coordinator = HandoffCoordinator(
+            bluetooth: bluetooth,
+            peer: MockPeer(),
+            timings: HandoffTimings(releaseDisconnect: 0.01, wakeWatch: 0.3)
+        )
+        var owned = keyboard
+        owned.holder = .thisMac
+        coordinator.useDevices([owned])
+
+        let released = await coordinator.handleRemoteRelease(keyboard.address, forget: false)
+        coordinator.noteDropped(keyboard.address)
+        try await Task.sleep(nanoseconds: 150_000_000)
+
+        #expect(released)
+        #expect(await bluetooth.connects.isEmpty)
+    }
+
+    @Test func useHereStopsWhenTheOtherMacKeepsTheDevice() async throws {
+        let bluetooth = MockBluetoothController()
+        let peer = MockPeer()
+        await peer.setFailRelease(true)
+        await bluetooth.setConnectResults([true], for: keyboard.address)
+        let coordinator = coordinator(bluetooth: bluetooth, peer: peer)
+
+        coordinator.useHere(devices: [keyboard])
+        try await waitUntil { coordinator.activity == .finished }
+
+        #expect(await bluetooth.connects.isEmpty)
+        #expect(coordinator.status(for: keyboard.address) == .failure("The other Mac still has Magic Keyboard."))
     }
 
     @Test func wakeYieldsToTheNewerClaim() async throws {
@@ -150,6 +273,36 @@ struct HandoffCoordinatorTests {
         #expect(coordinator.summary == "Already on this Mac.")
     }
 
+    @Test func useHereForOneDeviceKeepsTheOthers() async throws {
+        let bluetooth = MockBluetoothController()
+        let peer = MockPeer()
+        await bluetooth.setConnectResults([true], for: keyboard.address)
+        await bluetooth.setPaired([keyboard.address])
+        let coordinator = coordinator(bluetooth: bluetooth, peer: peer)
+        coordinator.useDevices([keyboard, trackpad])
+        var saved: [DeviceEntry] = []
+        coordinator.onDevicesChanged = { saved = $0 }
+
+        coordinator.useHere(devices: [keyboard])
+        try await waitUntil { coordinator.activity == .finished }
+
+        #expect(saved.map(\.address) == [keyboard.address, trackpad.address])
+    }
+
+    @Test func handOffForOneDeviceKeepsTheOthers() async throws {
+        let bluetooth = MockBluetoothController()
+        let peer = MockPeer()
+        let coordinator = coordinator(bluetooth: bluetooth, peer: peer)
+        coordinator.useDevices([keyboard, trackpad])
+        var saved: [DeviceEntry] = []
+        coordinator.onDevicesChanged = { saved = $0 }
+
+        coordinator.handOff(devices: [keyboard])
+        try await waitUntil { coordinator.activity == .finished }
+
+        #expect(saved.map(\.address) == [keyboard.address, trackpad.address])
+    }
+
     @Test func willSleepHandsOffWhenTheOtherMacAnswers() async throws {
         let bluetooth = MockBluetoothController()
         let peer = MockPeer()
@@ -173,8 +326,7 @@ struct HandoffCoordinatorTests {
             timings: HandoffTimings(
                 peerPing: 0.01,
                 connect: 0.01,
-                discoverFirst: 0.01,
-                discoverSecond: 0.01,
+                discover: 0.01,
                 releaseTimeout: 0.01,
                 claimTimeout: 0.01,
                 suppressSafety: 0.01,
@@ -191,6 +343,10 @@ extension MockBluetoothController {
         connectResults[address] = results
     }
 
+    func setRefused(_ address: DeviceAddress) {
+        refused.insert(address)
+    }
+
     func setDiscoverResults(_ results: [Bool], for address: DeviceAddress) {
         discoverResults[address] = results
     }
@@ -198,11 +354,20 @@ extension MockBluetoothController {
     func setConnected(_ addresses: Set<DeviceAddress>) {
         connected = addresses
     }
+
+    func setPaired(_ addresses: Set<DeviceAddress>) {
+        paired = addresses
+    }
+
+    func setFailDisconnect(_ value: Bool) {
+        failDisconnect = value
+    }
 }
 
 extension MockPeer {
     func setReachable(_ value: Bool) { reachable = value }
     func setRemoteClaims(_ claims: [ClaimStamp]) { remoteClaims = claims }
+    func setFailRelease(_ value: Bool) { failRelease = value }
 }
 
 @MainActor

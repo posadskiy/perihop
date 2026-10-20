@@ -11,8 +11,12 @@ struct SettingsView: View {
     @State private var errorMessage: String?
     @State private var code: String = ""
     @State private var host: String = ""
-    @State private var fingerprint = ""
-    @State private var displays: [String] = []
+    @State private var showIPAddress = false
+    @State private var confirmUnpair = false
+    @AppStorage("showDebugTools") private var showDebugTools = false
+    @State private var displays: [DockDisplay] = []
+    @State private var exporting = false
+    @State private var exportNote: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -28,32 +32,45 @@ struct SettingsView: View {
             Divider()
 
             Text("Link the other Mac").font(.subheadline)
-            Text("Enter the same code on both Macs. PeriHop uses it to ask the other Mac to let go of the keyboard.")
+            Text(isLinked ? "Linked with the other Mac." : "Leave this code on screen for the other Mac to type, or type that Mac's code here and press Pair.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
-            TextField("Pairing code", text: $code)
-                .textFieldStyle(.roundedBorder)
             HStack {
-                Button("Generate") {
-                    code = PairingCode.generate()
-                    refreshFingerprint()
-                }
-                Spacer()
-                if !fingerprint.isEmpty {
-                    Text(fingerprint)
-                        .font(.caption.monospaced())
-                        .foregroundStyle(.secondary)
+                TextField("Code", text: $code)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.title3.monospaced())
+                    .disabled(isLinked || model.isPairing)
+                if isLinked {
+                    Button("Unpair") { confirmUnpair = true }
+                } else {
+                    Button {
+                        code = model.refreshOffer()
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("New code")
+                    .disabled(model.isPairing)
+                    Button(model.isPairing ? "Pairing…" : "Pair") {
+                        Task { await connect() }
+                    }
+                    .disabled(model.isPairing)
                 }
             }
 
-            TextField("Other Mac's address (optional)", text: $host)
-                .textFieldStyle(.roundedBorder)
-            Text("Leave this empty on a normal network. If the other Mac doesn't appear, enter its IP address.")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+            if showIPAddress {
+                TextField("Other Mac's IP address", text: $host)
+                    .textFieldStyle(.roundedBorder)
+                Text("Used when the other Mac doesn't appear on its own.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Button("Use IP address") { showIPAddress = true }
+                    .font(.caption)
+            }
 
             if model.trustMismatch {
                 Text("The other Mac's identity changed.")
@@ -75,12 +92,17 @@ struct SettingsView: View {
             Text("When a checked display connects, PeriHop takes the devices.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
-            ForEach(displays, id: \.self) { id in
+            if displays.isEmpty {
+                Text("No external displays connected.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(displays) { display in
                 Toggle(isOn: Binding(
-                    get: { model.dockDisplays.contains(id) },
-                    set: { model.setDock(id, enabled: $0) }
+                    get: { model.dockDisplays.contains(display.id) },
+                    set: { model.setDock(display.id, enabled: $0) }
                 )) {
-                    Text(id).font(.caption.monospaced()).lineLimit(1)
+                    Text(display.name).lineLimit(1)
                 }
             }
 
@@ -89,30 +111,113 @@ struct SettingsView: View {
             }
 
             Divider()
-            HStack {
-                Button("Save") {
-                    model.savePairing(code: code, host: host)
+            Toggle("Debug", isOn: $showDebugTools)
+            if showDebugTools {
+                HStack {
+                    Button(exporting ? "Saving…" : "Save diagnostics") {
+                        Task { await saveDiagnostics() }
+                    }
+                    .disabled(exporting)
+                    Button("Clear diagnostics") { clearDiagnostics() }
+                        .disabled(exporting)
                 }
+                Text("Save writes the switch, link, and Bluetooth log. Clear keeps only what happens after this moment.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let exportNote {
+                    Text(exportNote)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            HStack {
                 Spacer()
-                Button("Done", action: onDone)
+                Button("Done", action: done)
                     .buttonStyle(.borderedProminent)
             }
         }
         .padding(16)
         .frame(width: 340)
         .onAppear {
-            code = model.pairingCode
+            code = model.pairingCode.isEmpty ? model.prepareOffer() : model.pairingCode
             host = model.peerHost
-            displays = DisplayWatcher.online()
-            refreshFingerprint()
+            showIPAddress = !host.isEmpty
+            displays = DisplayWatcher.externalOnline()
         }
-        .onChange(of: code) { _ in refreshFingerprint() }
+        .onChange(of: code) { newValue in
+            let capped = cappedCode(newValue)
+            if capped != code { code = capped }
+        }
+        .onChange(of: model.pairingCode) { newValue in
+            if !newValue.isEmpty { code = newValue }
+        }
         .onDisappear { model.saveShortcuts() }
+        .alert("Unpair the other Mac?", isPresented: $confirmUnpair) {
+            Button("Unpair", role: .destructive) { unpair() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This Mac forgets the code and shows a new one. The other Mac has to use that code to link again.")
+        }
     }
 
-    private func refreshFingerprint() {
-        let normalized = PairingCode.normalize(code)
-        fingerprint = normalized.count >= 8 ? PeerCrypto.fingerprint(code: normalized) : ""
+    private var isLinked: Bool {
+        !model.pairingCode.isEmpty
+    }
+
+    private func connect() async {
+        let ok = await model.pair(code: code, host: showIPAddress ? host : "")
+        if ok {
+            code = model.pairingCode
+            host = model.peerHost
+        }
+    }
+
+    private func unpair() {
+        Task {
+            await model.unpair()
+            code = model.prepareOffer()
+            host = ""
+            showIPAddress = false
+        }
+    }
+
+    private func done() {
+        if isLinked {
+            model.updatePeerHost(showIPAddress ? host : model.peerHost)
+        }
+        onDone()
+    }
+
+    private func cappedCode(_ raw: String) -> String {
+        let normalized = PairingCode.normalize(raw)
+        let saved = PairingCode.normalize(model.pairingCode)
+        if saved.count > PairingCode.length, normalized == saved {
+            return saved
+        }
+        return String(normalized.prefix(PairingCode.length))
+    }
+
+    private func clearDiagnostics() {
+        DiagnosticReport.clear()
+        exportNote = "Diagnostics cleared. The next save starts from now."
+        errorMessage = nil
+    }
+
+    private func saveDiagnostics() async {
+        exporting = true
+        defer { exporting = false }
+        let report = await DiagnosticReport.make(devices: model.config?.devices ?? [])
+        guard let url = DiagnosticReport.chooseDestination() else { return }
+        do {
+            try report.write(to: url, atomically: true, encoding: .utf8)
+            exportNote = "Saved \(url.lastPathComponent)."
+            errorMessage = nil
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        } catch {
+            errorMessage = error.localizedDescription
+        }
     }
 
     private func setLaunchAtLogin(_ enabled: Bool) {
