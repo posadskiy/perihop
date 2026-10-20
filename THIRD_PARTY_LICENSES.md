@@ -2,9 +2,8 @@
 
 ## blueutil
 
-PeriHop bundles a compiled copy of [blueutil](https://github.com/toy/blueutil)
-(`Vendor/blueutil`, built as a universal arm64/x86_64 binary from source) so
-end users don't need Homebrew installed. Its license:
+`Vendor/blueutil` is a compiled copy of [blueutil](https://github.com/toy/blueutil)
+kept from an earlier version. The app no longer runs it. Its license:
 
 Originally written by Frederik Seiffert <ego@frederikseiffert.de>
 

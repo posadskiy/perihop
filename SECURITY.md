@@ -9,7 +9,7 @@ version before reporting an issue.
 ## Reporting a Vulnerability
 
 Please **do not** open a public issue for security-relevant reports (e.g.
-anything involving the bundled `blueutil` binary, code signing, or how
+anything involving the link between the two Macs, code signing, or how
 PeriHop handles Bluetooth pairing data).
 
 Instead, use GitHub's private reporting flow:

@@ -32,10 +32,10 @@ open PeriHop.app
 swift test
 ```
 
-`SwitchFlowViewModel`'s retry/timeout state machine runs against a mock
-(`BluetoothControlling`), not real hardware, so those tests are fast and
-deterministic. `DeviceListParser` and `DeviceConfig` have their own
-round-trip/parsing tests.
+`HandoffCoordinator`'s switch state machine runs against a mock
+(`BluetoothControlling` and `PeerLinking`), not real hardware, so those tests
+are fast and deterministic. `DeviceListParser` and `DeviceConfig` have their
+own round-trip/parsing tests.
 
 If `swift test` fails with `no such module 'Testing'` or a `dlopen` error
 about `Testing.framework`, you're likely on Xcode Command Line Tools only
@@ -57,17 +57,12 @@ isn't needed there.
 
 - Keep PRs focused — one change per PR is easier to review than a bundle of
   unrelated fixes.
-- Match the existing code style: SwiftUI + a small MVVM split
-  (`BluetoothController` wraps the `blueutil` process, `SwitchFlowViewModel`
-  owns the switch state machine, views stay declarative). Avoid comments that
-  restate what the code already says — only comment on non-obvious *why*.
-- Test on real hardware if you can. This app's entire value is in the
-  unpair/pair/connect dance actually working — a change that compiles but
-  hasn't been run against a real keyboard/trackpad is only half-verified.
-- If you touch `Vendor/blueutil`, note why in the PR description — it's a
-  compiled binary vendored from [toy/blueutil](https://github.com/toy/blueutil)
-  specifically so end users don't need Homebrew (see
-  [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)).
+- Match the existing code style: SwiftUI, `LiveBluetoothController` for the
+  radio, `HandoffCoordinator` for the switch, `PeerService` for the link
+  between Macs, views stay declarative. Avoid comments that restate what the
+  code already says — only comment on non-obvious *why*.
+- Test on real hardware if you can. A change that compiles but hasn't been
+  run against a real keyboard and trackpad, on two Macs, is only half-verified.
 
 ## Submitting a PR
 
@@ -85,7 +80,7 @@ Bump `CFBundleShortVersionString` in
 [`Sources/PeriHop/Info.plist`](Sources/PeriHop/Info.plist), update
 `CHANGELOG.md`, and merge to `main`. The
 [release workflow](.github/workflows/release.yml) picks up the version
-change automatically, builds the universal `.app`, tags it `vX.Y.Z`, and
+change automatically, builds the `.app`, tags it `vX.Y.Z`, and
 publishes a GitHub Release with the zip attached — nothing else to do.
 
 To trigger it without a version bump (e.g. re-running after a failed build),

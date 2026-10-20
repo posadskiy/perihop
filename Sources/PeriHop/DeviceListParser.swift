@@ -1,7 +1,21 @@
 import Foundation
 
+enum BlueUtilError: Error, LocalizedError, Sendable {
+    case notInstalled
+    case commandFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .notInstalled:
+            return "Bluetooth helper is missing."
+        case .commandFailed(let message):
+            return message
+        }
+    }
+}
+
 /// Pure parsing logic for blueutil's `--format json` output, pulled out of
-/// `BluetoothController` so it's testable without spawning a real process.
+/// the Bluetooth controller so it's testable without spawning a real process.
 enum DeviceListParser {
     struct ProcessResult: Sendable {
         var status: Int32

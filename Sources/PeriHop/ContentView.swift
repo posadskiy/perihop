@@ -2,63 +2,42 @@ import SwiftUI
 import AppKit
 
 struct ContentView: View {
-    @StateObject private var switchFlow = SwitchFlowViewModel()
-    @State private var config: DeviceConfig? = DeviceConfigStore.load()
+    @EnvironmentObject private var model: AppModel
     @State private var showSetup = false
     @State private var showSettings = false
     @State private var showInfo = false
-    @State private var blueutilMissing = BluetoothController.blueutilPath == nil
     @State private var saveErrorMessage: String?
 
     var body: some View {
         Group {
-            if blueutilMissing {
-                missingBlueutilView
-            } else if showInfo {
+            if showInfo {
                 InfoView(onDone: { showInfo = false })
             } else if showSettings {
                 SettingsView(onDone: { showSettings = false })
-            } else if showSetup || config == nil {
+            } else if showSetup || model.config == nil {
                 SetupView(
-                    existing: config,
+                    existing: model.config,
                     onSave: { newConfig in
                         do {
                             try DeviceConfigStore.save(newConfig)
                             saveErrorMessage = nil
-                            config = newConfig
+                            model.config = newConfig
+                            model.handoff.useDevices(newConfig.devices)
                             showSetup = false
                         } catch {
-                            AppLog.config.error("Failed to save config: \(error)")
+                            AppLog.config.error("Failed to save config: \(error.localizedDescription)")
                             saveErrorMessage = "Couldn't save: \(error.localizedDescription)"
                         }
                     },
-                    onCancel: config == nil ? nil : { showSetup = false },
+                    onCancel: model.config == nil ? nil : { showSetup = false },
                     saveErrorMessage: saveErrorMessage
                 )
-            } else if let config {
+            } else if let config = model.config {
                 mainView(config: config)
             }
         }
-    }
-
-    private var missingBlueutilView: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Bluetooth helper missing").font(.subheadline).bold()
-            Text("PeriHop's built-in Bluetooth helper couldn't be found. Try reinstalling the app — if that doesn't fix it, and you're running from source (swift run), install it with:")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            Text("brew install blueutil")
-                .font(.system(.caption, design: .monospaced))
-                .padding(6)
-                .background(Color.secondary.opacity(0.15))
-                .cornerRadius(4)
-            Button("Check Again") {
-                blueutilMissing = BluetoothController.blueutilPath == nil
-            }
-        }
-        .padding(16)
-        .frame(width: 300)
+        .onAppear { model.menuVisible = true }
+        .onDisappear { model.menuVisible = false }
     }
 
     @ViewBuilder
@@ -68,104 +47,135 @@ struct ContentView: View {
                 Image(systemName: "keyboard")
                 Text("PeriHop").font(.headline)
                 Spacer()
-                Button {
-                    showInfo = true
-                } label: {
-                    Image(systemName: "info.circle")
-                }
-                .buttonStyle(.plain)
+                Button { showInfo = true } label: { Image(systemName: "info.circle") }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                Button { showSettings = true } label: { Image(systemName: "gearshape") }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+            }
+
+            Text(peerLine)
+                .font(.caption)
                 .foregroundStyle(.secondary)
-                Button {
-                    showSettings = true
-                } label: {
-                    Image(systemName: "gearshape")
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
+
+            if model.trustMismatch {
+                Text("The other Mac's identity changed. Trust it in Settings before switching.")
+                    .font(.caption)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             ForEach(config.devices, id: \.address) { device in
-                deviceRow(name: device.name, status: switchFlow.status(for: device.address), address: device.address)
+                deviceRow(device)
             }
 
-            switch switchFlow.stage {
-            case .idle, .finished:
-                Button("Switch Devices") {
-                    switchFlow.start(config: config)
+            if let summary = model.handoff.summary, model.handoff.activity == .finished {
+                Text(summary)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if let prompt = promptText {
+                Text(prompt)
+                    .font(.caption)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if model.handoff.activity == .working {
+                HStack {
+                    ProgressView().controlSize(.small)
+                    Spacer()
+                    Button("Stop") { model.handoff.stop() }
+                }
+            } else {
+                Button("Use here") {
+                    model.bringHere(config.devices)
                 }
                 .buttonStyle(.borderedProminent)
                 .frame(maxWidth: .infinity)
-
-            case .unpairing:
-                HStack {
-                    ProgressView().controlSize(.small)
-                    Text("Unpairing…").font(.caption)
+                Button("Hand off") {
+                    model.sendAway(config.devices)
                 }
-
-            case .reconnecting:
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Devices are unpaired from this Mac. Slide each switch to OFF, then back to ON — reconnecting automatically.")
-                        .font(.caption)
-                        .fixedSize(horizontal: false, vertical: true)
-                    HStack {
-                        ProgressView().controlSize(.small)
-                        Spacer()
-                        Button("Stop") { switchFlow.stop() }
-                    }
-                }
+                .frame(maxWidth: .infinity)
             }
 
             Divider()
             HStack {
                 Button("Edit Devices…") { showSetup = true }
+                    .disabled(model.handoff.activity == .working)
                 Spacer()
                 Button("Quit") { NSApplication.shared.terminate(nil) }
             }
             .font(.caption)
         }
         .padding(16)
-        .frame(width: 320)
+        .frame(width: 340)
         .task(id: config) {
-            // Re-checks real Bluetooth connection state every 10 seconds
-            // while the popover is open, so the checkmark reflects reality
-            // even if a device disconnects mid-session. refreshStatuses
-            // cancels any prior in-flight check itself, so overlapping polls
-            // can't stack up or resolve out of order.
-            // Cancels automatically when the popover closes.
             while !Task.isCancelled {
-                switchFlow.refreshStatuses(config: config)
+                model.handoff.refreshStatuses(devices: config.devices)
+                await model.refreshPeer()
                 try? await Task.sleep(nanoseconds: 10_000_000_000)
             }
         }
     }
 
+    private var peerLine: String {
+        if model.pairingCode.isEmpty {
+            return "Link your other Mac in Settings to switch in one click."
+        }
+        if model.peerReachable {
+            return "Other Mac is reachable."
+        }
+        return "Other Mac is asleep or offline. Use here still tries."
+    }
+
+    private var promptText: String? {
+        switch model.handoff.prompt {
+        case .none:
+            return nil
+        case .peerAsleep:
+            return "The other Mac isn't answering. Connecting to the keyboard directly."
+        case .pressKey(let name):
+            return "Press a key on \(name), or click the trackpad."
+        case .powerCycle(let name):
+            return "Turn \(name) off, then on. If it still doesn't appear, plug in its cable."
+        }
+    }
+
     @ViewBuilder
-    private func deviceRow(name: String, status: DeviceStatus, address: DeviceAddress) -> some View {
+    private func deviceRow(_ device: DeviceEntry) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
-                Text(name).font(.subheadline)
+                Text(device.name).font(.subheadline)
                 Spacer()
-                switch status {
+                if let percent = model.batteries[device.address] {
+                    Text("\(percent)%")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                switch model.handoff.status(for: device.address) {
                 case .unknown:
                     EmptyView()
                 case .disconnected:
-                    Image(systemName: "circle")
-                        .foregroundStyle(.secondary)
+                    Image(systemName: "circle").foregroundStyle(.secondary)
                 case .working:
                     ProgressView().controlSize(.small)
                 case .success:
                     Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
                 case .failure:
-                    HStack(spacing: 4) {
-                        Image(systemName: "xmark.circle.fill")
-                            .foregroundStyle(.red)
-                        Button("Retry") { switchFlow.retry(address) }
-                            .font(.caption2)
-                    }
+                    Image(systemName: "xmark.circle.fill").foregroundStyle(.red)
                 }
             }
-            if case .failure(let message) = status {
+            if case .failure(let message) = model.handoff.status(for: device.address) {
                 ErrorBox(message: message)
+            }
+            if model.handoff.activity != .working {
+                HStack {
+                    Button("Use here") { model.bringHere([device]) }
+                    Button("Hand off") { model.sendAway([device]) }
+                }
+                .font(.caption)
             }
         }
     }

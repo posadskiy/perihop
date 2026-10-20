@@ -129,7 +129,7 @@ struct SetupView: View {
         isLoadingPaired = true
         Task {
             do {
-                let devices = try await BluetoothController.paired()
+                let devices = try await LiveBluetoothController().pairedDevices()
                 isLoadingPaired = false
                 mergeDiscovered(devices)
             } catch {
@@ -145,7 +145,7 @@ struct SetupView: View {
         isScanning = true
         Task {
             do {
-                let devices = try await BluetoothController.inquiry(duration: 8)
+                let devices = try await LiveBluetoothController().inquire(timeout: 8)
                 isScanning = false
                 mergeDiscovered(devices)
                 if devices.isEmpty {
@@ -169,7 +169,13 @@ struct SetupView: View {
     private func save() {
         let devices = discovered
             .filter { selectedAddresses.contains($0.address) }
-            .map { DeviceEntry(name: $0.name, address: $0.address) }
+            .map { device in
+                if var existing = existing?.devices.first(where: { $0.address == device.address }) {
+                    existing.name = device.name
+                    return existing
+                }
+                return DeviceEntry(name: device.name, address: device.address)
+            }
         onSave(DeviceConfig(devices: devices))
     }
 }

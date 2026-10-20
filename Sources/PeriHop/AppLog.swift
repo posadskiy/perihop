@@ -7,4 +7,5 @@ enum AppLog {
     static let bluetooth = Logger(subsystem: "com.posadskiy.perihop", category: "Bluetooth")
     static let switchFlow = Logger(subsystem: "com.posadskiy.perihop", category: "SwitchFlow")
     static let config = Logger(subsystem: "com.posadskiy.perihop", category: "Config")
+    static let peer = Logger(subsystem: "com.posadskiy.perihop", category: "Peer")
 }

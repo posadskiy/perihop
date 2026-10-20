@@ -7,17 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-- `BluetoothController` is now genuinely `async` (continuation-based `Process` handling) instead of blocking a thread inside `Task.detached` at every call site
-- Reconnect/retry logic now uses a generation-token guard so a stale attempt can't clobber a newer `retry()`'s result
-- Device addresses are a distinct `DeviceAddress` type instead of raw `String`
-- `DeviceStatus.pending` split into `.unknown` (never checked) and `.disconnected` (checked, not connected)
-- blueutil's timeout watchdog now escalates from SIGTERM to SIGKILL if the process doesn't respond
-- Config save failures now surface in the UI instead of failing silently
-
 ### Added
-- Unit test target (Swift Testing) covering `DeviceListParser`, `DeviceConfig`/`DeviceAddress` round-tripping, and `SwitchFlowViewModel`'s retry/timeout state machine via a mock `BluetoothControlling`
-- Unified logging (`os.Logger`) for Bluetooth operations and switch-flow state transitions
+- The two Macs can link with a pairing code and hand the keyboard and trackpad over directly, including when the other Mac is asleep
+- A switch connects an existing bond first, and pairs again only if the accessory is in range and still refuses
+- The Mac that has the accessory keeps it from reconnecting until the other Mac confirms
+- Plugging the accessory in is picked up as a pairing
+- Shortcuts, a `perihop://` link, and a docked display can take or hand off the devices without opening the menu
+- Closing the lid hands the devices to the other Mac when it answers, and waking does not steal them back
+
+### Changed
+- The release build is Apple Silicon only. The macOS 27 SDK deprecates x86_64
+- Bluetooth control now uses IOBluetooth in the app instead of shelling out to blueutil
+- "Switch Devices" is now "Use here" and "Hand off"
+- The link key is stretched with PBKDF2, a Mac that fails the pairing code five times is ignored, and a changed identity has to be trusted before the next switch
 
 ## [0.1.0] - 2026-08-24
 

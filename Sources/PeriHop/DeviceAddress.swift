@@ -8,11 +8,25 @@ struct DeviceAddress: Hashable, Sendable, CustomStringConvertible, ExpressibleBy
     let rawValue: String
 
     init(_ rawValue: String) {
-        self.rawValue = rawValue
+        self.rawValue = Self.normalize(rawValue)
     }
 
     init(stringLiteral value: String) {
-        self.rawValue = value
+        self.rawValue = Self.normalize(value)
+    }
+
+    /// `AA:BB:CC:DD:EE:FF` and `aa-bb-cc-dd-ee-ff` name the same radio.
+    static func normalize(_ raw: String) -> String {
+        let hex = raw.lowercased().filter(\.isHexDigit)
+        guard hex.count == 12 else { return raw.lowercased() }
+        var parts: [String] = []
+        var index = hex.startIndex
+        for _ in 0..<6 {
+            let next = hex.index(index, offsetBy: 2)
+            parts.append(String(hex[index..<next]))
+            index = next
+        }
+        return parts.joined(separator: "-")
     }
 
     var description: String { rawValue }

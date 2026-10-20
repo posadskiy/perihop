@@ -40,7 +40,7 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Build universal PeriHop.app
+      - name: Build PeriHop.app
         if: steps.check.outputs.exists == 'false'
         run: ./build.sh
 

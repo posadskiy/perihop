@@ -8,7 +8,13 @@ let package = Package(
         .executableTarget(
             name: "PeriHop",
             path: "Sources/PeriHop",
-            exclude: ["Info.plist"]
+            exclude: ["Info.plist"],
+            linkerSettings: [
+                .linkedFramework("IOBluetooth"),
+                .linkedFramework("IOKit"),
+                .linkedFramework("Carbon"),
+                .linkedFramework("CoreGraphics"),
+            ]
         ),
         .testTarget(
             name: "PeriHopTests",
