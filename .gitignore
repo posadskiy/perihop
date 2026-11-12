@@ -10,3 +10,5 @@ PeriHop.app/
 # IDE
 .idea/
 .swiftpm/
+
+.private/

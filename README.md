@@ -41,9 +41,9 @@ the same pairing code on both Macs so they can find each other.
 
 **Use here** — click the menu bar icon → "Use here". The Mac that has the
 devices disconnects them, and this Mac connects. If the other Mac is
-asleep, this Mac tries on its own. If the accessory only remembers one
-Mac, PeriHop asks you to press a key and, if that isn't enough, to turn
-it off and on once.
+asleep, this Mac tries on its own. It pages the accessory by address,
+or pairs that address directly when this Mac has no bond. Turn the
+accessory off and on only if that connection does not come up.
 
 **Hand off** — disconnects the devices from this Mac and leaves them for
 the other one. On the Mac you want to use, click "Use here". Each device
