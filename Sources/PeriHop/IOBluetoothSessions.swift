@@ -65,9 +65,10 @@ final class ConnectionSession: NSObject, BluetoothSession {
 final class PairSession: NSObject, BluetoothSession {
     private var continuation: CheckedContinuation<Void, Error>?
     private var pairer: IOBluetoothDevicePair?
+    private var timeoutTask: Task<Void, Never>?
     private var finished = false
 
-    func pair(_ device: IOBluetoothDevice) async throws {
+    func pair(_ device: IOBluetoothDevice, timeout: TimeInterval) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             self.continuation = continuation
             guard !finished else {
@@ -81,6 +82,14 @@ final class PairSession: NSObject, BluetoothSession {
             if result != kIOReturnSuccess {
                 AppLog.bluetooth.error("pair start \(IOReturnLabel.describe(result))")
                 self.finish(.failure(BluetoothError.failed("Couldn't start pairing.")))
+                return
+            }
+            self.timeoutTask = Task { @MainActor in
+                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                guard !Task.isCancelled else { return }
+                AppLog.bluetooth.error("pair timed out after \(Int(timeout))s")
+                self.pairer?.stop()
+                self.finish(.failure(BluetoothError.failed("Pairing timed out.")))
             }
         }
     }
@@ -116,6 +125,8 @@ final class PairSession: NSObject, BluetoothSession {
     /// result is in and this session may be released.
     private func finish(_ result: Result<Void, Error>) {
         finished = true
+        timeoutTask?.cancel()
+        timeoutTask = nil
         pairer?.delegate = nil
         guard let continuation else { return }
         self.continuation = nil
@@ -148,16 +159,6 @@ final class InquirySession: NSObject, BluetoothSession {
         guard let inquiry = IOBluetoothDeviceInquiry(delegate: self) else { return }
         inquiry.updateNewDeviceNames = false
         self.inquiry = inquiry
-    }
-
-    func waitFor(address: DeviceAddress, timeout: TimeInterval) async -> Bool {
-        guard !finished else { return foundTarget }
-        target = address
-        deadline = Date().addingTimeInterval(timeout)
-        return await withCheckedContinuation { continuation in
-            self.continuation = continuation
-            self.beginSearch()
-        }
     }
 
     func collect(timeout: TimeInterval) async -> [BTDevice] {
