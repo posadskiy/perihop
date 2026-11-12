@@ -2,14 +2,88 @@ import CryptoKit
 import Foundation
 import Network
 
-/// One authenticated TCP link to the other Mac. Runs the handshake, then
-/// frames sealed messages as a 4-byte big-endian length and a ChaChaPoly box.
+/// A byte pipe to the other Mac: TCP on the network, or an L2CAP channel
+/// over Bluetooth LE when the network is in the way.
+protocol PeerStream: AnyObject, Sendable {
+    /// Names the far end for the log and the handshake limiter.
+    var label: String { get }
+    /// Returns once bytes can flow.
+    func open() async throws
+    func write(_ data: Data) async throws
+    /// At least one byte. Empty means the far end closed.
+    func readChunk() async throws -> Data
+    func close()
+}
+
+final class NetworkStream: PeerStream, @unchecked Sendable {
+    let connection: NWConnection
+
+    init(_ connection: NWConnection) {
+        self.connection = connection
+    }
+
+    var label: String { PeerEndpoint.host(of: connection.endpoint) }
+
+    func open() async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            let gate = FirstOnly()
+            connection.stateUpdateHandler = { state in
+                switch state {
+                case .ready:
+                    gate.run { continuation.resume() }
+                case .failed(let error):
+                    gate.run { continuation.resume(throwing: error) }
+                case .cancelled:
+                    gate.run { continuation.resume(throwing: PeerError.unreachable) }
+                case .waiting:
+                    // Nothing is listening there. Waiting only helps a
+                    // caller with no deadline, and every dial has one.
+                    gate.run { continuation.resume(throwing: PeerError.unreachable) }
+                default:
+                    break
+                }
+            }
+            connection.start(queue: .global())
+        }
+    }
+
+    func write(_ data: Data) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            connection.send(content: data, completion: .contentProcessed { error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume()
+                }
+            })
+        }
+    }
+
+    func readChunk() async throws -> Data {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
+            connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { data, _, _, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume(returning: data ?? Data())
+                }
+            }
+        }
+    }
+
+    func close() {
+        connection.cancel()
+    }
+}
+
+/// One authenticated link to the other Mac. Runs the handshake, then frames
+/// sealed messages as a 4-byte big-endian length and a ChaChaPoly box.
 final class PeerSocket: @unchecked Sendable {
     enum Role: Sendable { case client, server }
 
     static let maxFrame = 1_000_000
 
-    let connection: NWConnection
+    let stream: PeerStream
     private let role: Role
     private let key: SymmetricKey
     private let lock = NSLock()
@@ -17,11 +91,16 @@ final class PeerSocket: @unchecked Sendable {
     private var buffer = Data()
     private var closed = false
     private var timedOut = false
+    private var heardAt = Date()
 
-    init(connection: NWConnection, role: Role, key: SymmetricKey) {
-        self.connection = connection
+    init(stream: PeerStream, role: Role, key: SymmetricKey) {
+        self.stream = stream
         self.role = role
         self.key = key
+    }
+
+    convenience init(connection: NWConnection, role: Role, key: SymmetricKey) {
+        self.init(stream: NetworkStream(connection), role: role, key: key)
     }
 
     var isOpen: Bool {
@@ -30,11 +109,18 @@ final class PeerSocket: @unchecked Sendable {
         return cipher != nil && !closed
     }
 
-    var remoteHost: String { PeerEndpoint.host(of: connection.endpoint) }
+    var remoteHost: String { stream.label }
+
+    /// When the far end was last heard from.
+    var lastHeard: Date {
+        lock.lock()
+        defer { lock.unlock() }
+        return heardAt
+    }
 
     /// Connects and authenticates. A peer that stalls the handshake is cut off
-    /// after `timeout` with `PeerError.timeout`. On any failure the connection
-    /// is cancelled.
+    /// after `timeout` with `PeerError.timeout`. On any failure the stream
+    /// is closed.
     func open(timeout: TimeInterval) async throws {
         let watchdog = Task {
             try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
@@ -56,6 +142,7 @@ final class PeerSocket: @unchecked Sendable {
         defer { lock.unlock() }
         guard !closed else { return false }
         cipher = SessionCipher(key: session)
+        heardAt = Date()
         return true
     }
 
@@ -69,7 +156,7 @@ final class PeerSocket: @unchecked Sendable {
         lock.lock()
         closed = true
         lock.unlock()
-        connection.cancel()
+        stream.close()
     }
 
     func send(_ message: PeerMessage) async throws {
@@ -77,7 +164,7 @@ final class PeerSocket: @unchecked Sendable {
         var length = UInt32(frame.count).bigEndian
         var packet = Data(bytes: &length, count: 4)
         packet.append(frame)
-        try await sendRaw(packet)
+        try await stream.write(packet)
     }
 
     func receive() async throws -> PeerMessage {
@@ -86,7 +173,15 @@ final class PeerSocket: @unchecked Sendable {
         let length = header.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self).bigEndian }
         guard length > 0, length < Self.maxFrame else { throw PeerError.closed }
         let frame = try await read(Int(length))
-        return try withCipher { try $0.open(frame) }
+        let message = try withCipher { try $0.open(frame) }
+        noteHeard()
+        return message
+    }
+
+    private func noteHeard() {
+        lock.lock()
+        heardAt = Date()
+        lock.unlock()
     }
 
     private func withCipher<T>(_ body: (inout SessionCipher) throws -> T) throws -> T {
@@ -98,19 +193,24 @@ final class PeerSocket: @unchecked Sendable {
     }
 
     private func handshake() async throws -> SymmetricKey {
-        try await waitReady()
+        do {
+            try await stream.open()
+        } catch {
+            markClosed()
+            throw error
+        }
         switch role {
         case .client:
             let hello = PeerCrypto.clientHello()
-            try await sendRaw(hello.packet)
+            try await stream.write(hello.packet)
             let response = try await read(PeerCrypto.serverResponseSize)
             let finished = try PeerCrypto.clientFinish(serverPacket: response, clientNonce: hello.nonce, key: key)
-            try await sendRaw(finished.packet)
+            try await stream.write(finished.packet)
             return finished.session
         case .server:
             let hello = try await read(PeerCrypto.clientHelloSize)
             let response = try PeerCrypto.serverRespond(clientPacket: hello, key: key)
-            try await sendRaw(response.packet)
+            try await stream.write(response.packet)
             let auth = try await read(PeerCrypto.clientAuthSize)
             return try PeerCrypto.serverFinish(
                 clientAuth: auth,
@@ -125,7 +225,7 @@ final class PeerSocket: @unchecked Sendable {
         lock.lock()
         timedOut = cipher == nil
         lock.unlock()
-        if timedOut { connection.cancel() }
+        if timedOut { stream.close() }
     }
 
     private func markClosed() {
@@ -134,59 +234,14 @@ final class PeerSocket: @unchecked Sendable {
         lock.unlock()
     }
 
-    private func waitReady() async throws {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            let gate = FirstOnly()
-            connection.stateUpdateHandler = { [weak self] state in
-                switch state {
-                case .ready:
-                    gate.run { continuation.resume() }
-                case .failed(let error):
-                    self?.markClosed()
-                    gate.run { continuation.resume(throwing: error) }
-                case .cancelled:
-                    self?.markClosed()
-                    gate.run { continuation.resume(throwing: PeerError.unreachable) }
-                default:
-                    break
-                }
-            }
-            connection.start(queue: .global())
-        }
-    }
-
-    private func sendRaw(_ data: Data) async throws {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            connection.send(content: data, completion: .contentProcessed { error in
-                if let error {
-                    continuation.resume(throwing: error)
-                } else {
-                    continuation.resume()
-                }
-            })
-        }
-    }
-
     /// Only one reader runs at a time: the handshake, then the receive loop.
     private func read(_ count: Int) async throws -> Data {
         while bufferedCount() < count {
-            let chunk = try await receiveChunk()
+            let chunk = try await stream.readChunk()
             guard !chunk.isEmpty else { throw PeerError.closed }
             append(chunk)
         }
         return take(count)
-    }
-
-    private func receiveChunk() async throws -> Data {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
-            connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { data, _, _, error in
-                if let error {
-                    continuation.resume(throwing: error)
-                } else {
-                    continuation.resume(returning: data ?? Data())
-                }
-            }
-        }
     }
 
     private func bufferedCount() -> Int {

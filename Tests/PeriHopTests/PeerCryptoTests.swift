@@ -52,33 +52,6 @@ struct PeerCryptoTests {
     }
 }
 
-struct HandoffClaimTests {
-    @Test func newerRemoteClaimWins() {
-        var local = DeviceEntry(name: "Magic Keyboard", address: "aa-bb-cc-dd-ee-ff", holder: .thisMac)
-        local.holderSince = Date(timeIntervalSince1970: 10)
-        let remote = [
-            ClaimStamp(address: "AA:BB:CC:DD:EE:FF", holderSince: Date(timeIntervalSince1970: 30), mine: true),
-        ]
-
-        let updated = HandoffClaims.apply(local: [local], remote: remote)
-
-        #expect(updated[0].holder == .otherMac)
-        #expect(updated[0].holderSince == Date(timeIntervalSince1970: 30))
-    }
-
-    @Test func olderRemoteClaimDoesNotSteal() {
-        var local = DeviceEntry(name: "Magic Keyboard", address: "aa-bb-cc-dd-ee-ff", holder: .thisMac)
-        local.holderSince = Date(timeIntervalSince1970: 40)
-        let remote = [
-            ClaimStamp(address: local.address.rawValue, holderSince: Date(timeIntervalSince1970: 10), mine: true),
-        ]
-
-        let updated = HandoffClaims.apply(local: [local], remote: remote)
-
-        #expect(updated[0].holder == .thisMac)
-    }
-}
-
 struct DeviceAddressNormalizationTests {
     @Test func colonAndHyphenFormsMatch() {
         #expect(DeviceAddress("AA:BB:CC:DD:EE:FF") == DeviceAddress("aa-bb-cc-dd-ee-ff"))

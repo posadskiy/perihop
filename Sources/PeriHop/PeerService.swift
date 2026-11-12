@@ -14,6 +14,15 @@ final class PeerService: PeerLinking, @unchecked Sendable {
     private var identityHandler: IdentityHandler?
     /// Start and stop calls apply in the order they were made.
     private var lastChange: Task<Void, Never>?
+    private var confirmed = false
+
+    /// True once both Macs have confirmed the pairing code. A code that is
+    /// only on offer does not count: nothing is handed to a Mac that never
+    /// answered.
+    var linked: Bool {
+        get { locked { confirmed } }
+        set { locked { confirmed = newValue } }
+    }
 
     var onRequest: RequestHandler? {
         get { locked { requestHandler } }
@@ -25,20 +34,29 @@ final class PeerService: PeerLinking, @unchecked Sendable {
         set { locked { identityHandler = newValue } }
     }
 
-    func start(code: String, manualHost: String?, pinnedFingerprint: String? = nil, learnedHost: String? = nil) {
+    func start(code: String, manualHost: String?, pinnedFingerprint: String? = nil, learnedHost: String? = nil, bluetooth: Bool = true) {
         enqueue {
-            await self.configure(code: code, manualHost: manualHost, pinnedFingerprint: pinnedFingerprint, learnedHost: learnedHost)
+            await self.configure(code: code, manualHost: manualHost, pinnedFingerprint: pinnedFingerprint, learnedHost: learnedHost, bluetooth: bluetooth)
         }
     }
 
-    func activate(code: String, manualHost: String?, pinnedFingerprint: String? = nil, learnedHost: String? = nil) async {
+    func activate(code: String, manualHost: String?, pinnedFingerprint: String? = nil, learnedHost: String? = nil, bluetooth: Bool = true) async {
         await enqueue {
-            await self.configure(code: code, manualHost: manualHost, pinnedFingerprint: pinnedFingerprint, learnedHost: learnedHost)
+            await self.configure(code: code, manualHost: manualHost, pinnedFingerprint: pinnedFingerprint, learnedHost: learnedHost, bluetooth: bluetooth)
         }.value
     }
 
     func stop() {
         enqueue { [engine] in await engine.stop() }
+    }
+
+    func isLinked() async -> Bool {
+        guard linked else { return false }
+        return await engine.isConfigured
+    }
+
+    func isConnected() async -> Bool {
+        await engine.hasOpenLink
     }
 
     func ping(timeout: TimeInterval) async -> Bool {
@@ -47,7 +65,7 @@ final class PeerService: PeerLinking, @unchecked Sendable {
             return false
         }
         do {
-            let reply = try await engine.request(PeerMessage(id: UUID(), type: "ping"), timeout: timeout)
+            let reply = try await engine.request(PeerMessage(type: "ping"), timeout: timeout)
             let ok = reply.type == "pong"
             await engine.noteReachable(ok, detail: ok ? "" : "reply \(reply.type)")
             return ok
@@ -57,58 +75,55 @@ final class PeerService: PeerLinking, @unchecked Sendable {
         }
     }
 
-    func requestRelease(_ address: DeviceAddress, forget: Bool, timeout: TimeInterval) async throws {
-        let reply = try await engine.request(
-            PeerMessage(id: UUID(), type: "release", address: address.rawValue, forget: forget),
-            timeout: timeout
-        )
-        guard reply.type == "released" else { throw PeerError.closed }
-    }
-
-    func notifyOwned(_ address: DeviceAddress) async {
-        await notify("owned", address: address)
-    }
-
-    func notifyFailed(_ address: DeviceAddress) async {
-        await notify("failed", address: address)
-    }
-
-    func requestRollback(_ address: DeviceAddress, timeout: TimeInterval) async {
-        _ = try? await engine.request(
-            PeerMessage(id: UUID(), type: "rollback", address: address.rawValue),
-            timeout: timeout
-        )
-    }
-
-    func notifySleeping(_ addresses: [DeviceAddress]) async {
-        guard !addresses.isEmpty else { return }
-        _ = try? await engine.request(
-            PeerMessage(id: UUID(), type: "sleeping", addresses: addresses.map(\.rawValue)),
-            timeout: 4
-        )
-    }
-
-    func exchangeClaims(_ local: [ClaimStamp], timeout: TimeInterval) async -> [ClaimStamp] {
-        guard await engine.isConfigured else { return [] }
+    func status(timeout: TimeInterval) async -> PeerStatus? {
+        guard await engine.isConfigured else { return nil }
         do {
-            let reply = try await engine.request(
-                PeerMessage(id: UUID(), type: "claims", stamps: local),
-                timeout: timeout
-            )
-            return reply.stamps ?? []
+            // With no link open, the answer has to wait for a dial, which
+            // over Bluetooth takes a few seconds.
+            let patience = await engine.hasOpenLink ? timeout : max(timeout, PeerEngine.dialPatience)
+            let reply = try await engine.request(PeerMessage(type: "status"), timeout: patience)
+            await engine.noteReachable(true, detail: "")
+            return reply.status ?? PeerStatus(held: [], devices: [])
         } catch {
-            return []
+            await engine.noteReachable(false, detail: error.localizedDescription)
+            return nil
         }
     }
 
-    private func notify(_ type: String, address: DeviceAddress) async {
-        _ = try? await engine.request(
-            PeerMessage(id: UUID(), type: type, address: address.rawValue),
-            timeout: 3
-        )
+    func requestRelease(_ addresses: [DeviceAddress], timeout: TimeInterval) async -> Set<DeviceAddress>? {
+        let message = PeerMessage(type: "release", addresses: addresses.map(\.rawValue))
+        guard let reply = try? await engine.request(message, timeout: timeout), reply.type == "released" else {
+            return nil
+        }
+        return Set((reply.addresses ?? []).map { DeviceAddress($0) })
     }
 
-    private func configure(code: String, manualHost: String?, pinnedFingerprint: String?, learnedHost: String?) async {
+    func requestTake(_ devices: [DeviceEntry], timeout: TimeInterval) async -> Bool {
+        guard !devices.isEmpty else { return true }
+        let reply = try? await engine.request(PeerMessage(type: "take", devices: devices), timeout: timeout)
+        return reply?.type == "taking"
+    }
+
+    func notifyOutcome(_ address: DeviceAddress, connected: Bool) async {
+        let message = PeerMessage(type: "outcome", addresses: [address.rawValue], ok: connected)
+        _ = try? await engine.request(message, timeout: 4)
+    }
+
+    func notifyStatus(_ status: PeerStatus) async {
+        await engine.setStatus(status)
+    }
+
+    /// The other Mac's address, learned from its heartbeat.
+    func learn(host: String) async {
+        await engine.learn(host: host)
+    }
+
+    /// True while the link runs over Bluetooth instead of the network.
+    func usesBluetooth() async -> Bool {
+        await engine.usesBluetooth
+    }
+
+    private func configure(code: String, manualHost: String?, pinnedFingerprint: String?, learnedHost: String?, bluetooth: Bool) async {
         let normalized = PairingCode.normalize(code)
         guard normalized.count >= PairingCode.length else {
             AppLog.peer.info("peer stopped, pairing code is too short")
@@ -120,7 +135,8 @@ final class PeerService: PeerLinking, @unchecked Sendable {
             fingerprint: PeerCrypto.fingerprint(key: key),
             manualHost: manualHost,
             pinnedFingerprint: pinnedFingerprint,
-            learnedHost: learnedHost
+            learnedHost: learnedHost,
+            bluetooth: bluetooth
         )
         await engine.start(
             key: key,
@@ -154,14 +170,18 @@ final class PeerService: PeerLinking, @unchecked Sendable {
     }
 }
 
-/// Holds at most one link to the other Mac, matches replies to requests, and
-/// hands incoming requests to `onRequest` one at a time, in arrival order.
+/// Keeps the links to the other Mac, matches replies to requests, and hands
+/// incoming requests to `onRequest` one at a time, in arrival order.
+///
+/// Both Macs may dial at the same moment, so more than one link can be up.
+/// Each stays usable: a reply goes back on the link its request came in on.
 private actor PeerEngine {
     struct Settings: Equatable, Sendable {
         var fingerprint: String
         var manualHost: String?
         var pinnedFingerprint: String?
         var learnedHost: String?
+        var bluetooth = true
     }
 
     private struct Pending {
@@ -175,18 +195,32 @@ private actor PeerEngine {
         let socket: PeerSocket
     }
 
+    /// How long a request may wait for a link to come up from nothing.
+    static let dialPatience: TimeInterval = 7
+
     private static let handshakeTimeout: TimeInterval = 6
     private static let heartbeatInterval: UInt64 = 15_000_000_000
+    /// A link nobody has used for this long is closed when a newer one exists.
+    private static let idleLimit: TimeInterval = 50
+    /// The network gets this head start before Bluetooth is tried.
+    private static let bluetoothDelay: TimeInterval = 1.2
+    private static let bluetoothDial: TimeInterval = 5
+    /// After a Bluetooth dial finds nobody, heartbeats skip it for this
+    /// long, doubling up to the limit, so an absent Mac costs little radio.
+    private static let bluetoothBackoff: TimeInterval = 30
+    private static let bluetoothBackoffLimit: TimeInterval = 300
 
     private let listener = PeerListener()
+    private let bluetooth = BluetoothLink()
     private var directory: PeerDirectory
     private var key: SymmetricKey?
     private var settings: Settings?
     private var limiter = HandshakeLimiter()
     private var browser: NWBrowser?
-    private var socket: PeerSocket?
+    /// Open links, oldest first. Requests go out on the newest.
+    private var sockets: [PeerSocket] = []
     private var dialing: Task<PeerSocket, Error>?
-    private var receiveTask: Task<Void, Never>?
+    private var dialingUrgent = false
     private var heartbeat: Task<Void, Never>?
     private var inbox: AsyncStream<Inbound>.Continuation?
     private var pendings: [UUID: Pending] = [:]
@@ -194,6 +228,9 @@ private actor PeerEngine {
     private var onIdentity: PeerService.IdentityHandler?
     private var announcedPeers: [String: Bool] = [:]
     private var lastReachable: Bool?
+    private var status: PeerStatus?
+    private var bluetoothQuietUntil = Date.distantPast
+    private var bluetoothBackoff = PeerEngine.bluetoothBackoff
     /// Bumped by every start and stop; links finishing under an older value are dropped.
     private var generation = 0
 
@@ -203,6 +240,17 @@ private actor PeerEngine {
     }
 
     var isConfigured: Bool { key != nil }
+
+    var hasOpenLink: Bool { preferredSocket != nil }
+
+    var usesBluetooth: Bool {
+        preferredSocket?.stream is ChannelStream
+    }
+
+    /// The newest open link, with the network ahead of Bluetooth.
+    private var preferredSocket: PeerSocket? {
+        sockets.last { $0.isOpen && !($0.stream is ChannelStream) } ?? sockets.last(where: \.isOpen)
+    }
 
     func start(
         key: SymmetricKey,
@@ -220,7 +268,7 @@ private actor PeerEngine {
         self.settings = settings
         directory.codeFingerprint = settings.fingerprint
         directory.pinnedFingerprint = settings.pinnedFingerprint
-        AppLog.peer.info("listening name=\(directory.localName) manualHost=\(settings.manualHost ?? "-") pinned=\(settings.pinnedFingerprint != nil)")
+        AppLog.peer.info("listening name=\(directory.localName) manualHost=\(settings.manualHost ?? "-") bluetooth=\(settings.bluetooth)")
         startInbox()
         await listener.start(
             PeerListener.Advertisement(
@@ -229,7 +277,12 @@ private actor PeerEngine {
                 instance: directory.localInstance
             )
         ) { [weak self] connection in
-            Task { await self?.accept(connection) }
+            Task { await self?.accept(NetworkStream(connection)) }
+        }
+        if settings.bluetooth {
+            bluetooth.start(key: key) { [weak self] stream in
+                Task { await self?.accept(stream) }
+            }
         }
         startBrowser()
         startHeartbeat()
@@ -249,6 +302,16 @@ private actor PeerEngine {
         }
     }
 
+    func setStatus(_ status: PeerStatus) async {
+        self.status = status
+        await sendHello()
+    }
+
+    func learn(host: String) {
+        guard settings?.learnedHost != host else { return }
+        settings?.learnedHost = host
+    }
+
     /// `timeout` covers dialing, the handshake, and the reply.
     func request(_ message: PeerMessage, timeout: TimeInterval) async throws -> PeerMessage {
         let loud = PeerTraffic.notable(message)
@@ -262,8 +325,8 @@ private actor PeerEngine {
             }
             return reply
         } catch {
-            if loud || message.type == "hello" {
-                AppLog.peer.error("out \(message.type) \(message.address ?? "-") failed: \(error.localizedDescription)")
+            if loud {
+                AppLog.peer.error("out \(message.type) failed: \(error.localizedDescription)")
             }
             throw error
         }
@@ -277,7 +340,7 @@ private actor PeerEngine {
             let timer = Task {
                 try? await Task.sleep(nanoseconds: UInt64(max(0, timeout) * 1_000_000_000))
                 guard !Task.isCancelled else { return }
-                self.resolve(id, with: .failure(PeerError.timeout))
+                self.expire(id)
             }
             pendings[id] = Pending(continuation: continuation, timer: timer)
             Task { await self.deliver(message) }
@@ -286,13 +349,24 @@ private actor PeerEngine {
 
     private func deliver(_ message: PeerMessage) async {
         do {
-            let socket = try await connection()
+            // A heartbeat is not worth waking the Bluetooth radio for.
+            let socket = try await connection(urgent: message.type != "hello")
             guard pendings[message.id] != nil else { return }
             pendings[message.id]?.socket = socket
             try await socket.send(message)
         } catch {
             resolve(message.id, with: .failure(error))
         }
+    }
+
+    /// A request that got no answer on a link that has gone quiet means the
+    /// link is dead: the other Mac fell asleep with the socket open. Closing
+    /// it makes the next request dial again instead of waiting on it.
+    private func expire(_ id: UUID) {
+        if let socket = pendings[id]?.socket, Date().timeIntervalSince(socket.lastHeard) > 3 {
+            drop(socket, reason: "no answer")
+        }
+        resolve(id, with: .failure(PeerError.timeout))
     }
 
     private func resolve(_ id: UUID, with result: Result<PeerMessage, Error>) {
@@ -317,21 +391,92 @@ private actor PeerEngine {
 
     // MARK: Links
 
-    /// Concurrent requests share one dial instead of racing to replace each other's link.
-    private func connection() async throws -> PeerSocket {
-        if let socket, socket.isOpen { return socket }
-        if let dialing { return try await dialing.value }
-        let task = Task { try await self.dial() }
+    /// Concurrent requests share one dial instead of racing each other.
+    private func connection(urgent: Bool) async throws -> PeerSocket {
+        if let socket = preferredSocket { return socket }
+        // A dial a heartbeat started skips Bluetooth. A request that matters
+        // does not settle for it.
+        if let dialing, dialingUrgent || !urgent { return try await dialing.value }
+        let task = Task { try await self.dial(urgent: urgent) }
         dialing = task
+        dialingUrgent = urgent
         defer { if dialing == task { dialing = nil } }
         return try await task.value
     }
 
-    private func dial() async throws -> PeerSocket {
+    /// Dials over the network and, a moment later, over Bluetooth. The first
+    /// link to come up wins. The network is tried at the address typed in
+    /// Settings, then where Bonjour sees the other Mac now, then at the
+    /// address it last reported.
+    private func dial(urgent: Bool) async throws -> PeerSocket {
         guard let key else { throw PeerError.noCode }
-        guard let endpoint = resolveEndpoint() else { throw PeerError.unreachable }
         let generation = self.generation
-        let socket = PeerSocket(connection: NWConnection(to: endpoint, using: PeerEndpoint.parameters), role: .client, key: key)
+        let (results, feed) = AsyncStream.makeStream(of: Result<PeerSocket, Error>.self)
+        var running = 1
+        Task {
+            do {
+                feed.yield(.success(try await self.dialNetwork(key: key, generation: generation)))
+            } catch {
+                feed.yield(.failure(error))
+            }
+        }
+        if settings?.bluetooth == true, urgent || Date() >= bluetoothQuietUntil {
+            running += 1
+            Task {
+                do {
+                    feed.yield(.success(try await self.dialBluetooth(key: key, generation: generation)))
+                } catch {
+                    feed.yield(.failure(error))
+                }
+            }
+        }
+        var lastError: Error = PeerError.unreachable
+        for await result in results {
+            running -= 1
+            switch result {
+            case .success(let socket):
+                return socket
+            case .failure(let error):
+                if error as? PeerError != .closed { lastError = error }
+            }
+            if running == 0 { break }
+        }
+        throw lastError
+    }
+
+    private func dialNetwork(key: SymmetricKey, generation: Int) async throws -> PeerSocket {
+        var lastError: Error = PeerError.unreachable
+        for endpoint in endpoints() {
+            guard generation == self.generation else { throw PeerError.closed }
+            let stream = NetworkStream(NWConnection(to: endpoint, using: PeerEndpoint.parameters))
+            do {
+                return try await open(stream, key: key, generation: generation)
+            } catch {
+                lastError = error
+            }
+        }
+        throw lastError
+    }
+
+    private func dialBluetooth(key: SymmetricKey, generation: Int) async throws -> PeerSocket {
+        try? await Task.sleep(nanoseconds: UInt64(Self.bluetoothDelay * 1_000_000_000))
+        // The network answered during the head start.
+        guard generation == self.generation, preferredSocket == nil else { throw PeerError.closed }
+        do {
+            let stream = try await bluetooth.connect(timeout: Self.bluetoothDial)
+            let socket = try await open(stream, key: key, generation: generation)
+            bluetoothBackoff = Self.bluetoothBackoff
+            bluetoothQuietUntil = .distantPast
+            return socket
+        } catch {
+            bluetoothQuietUntil = Date().addingTimeInterval(bluetoothBackoff)
+            bluetoothBackoff = min(bluetoothBackoff * 2, Self.bluetoothBackoffLimit)
+            throw error
+        }
+    }
+
+    private func open(_ stream: PeerStream, key: SymmetricKey, generation: Int) async throws -> PeerSocket {
+        let socket = PeerSocket(stream: stream, role: .client, key: key)
         let host = socket.remoteHost
         guard limiter.allow(host) else { throw PeerError.handshakeFailed }
         do {
@@ -339,8 +484,8 @@ private actor PeerEngine {
         } catch {
             if error as? PeerError == .handshakeFailed {
                 limiter.recordFailure(host)
+                AppLog.peer.error("outgoing link \(host) rejected the pairing code")
             }
-            AppLog.peer.error("outgoing link \(host) failed: \(error.localizedDescription)")
             throw error
         }
         guard generation == self.generation else {
@@ -353,17 +498,17 @@ private actor PeerEngine {
         return socket
     }
 
-    private func accept(_ connection: NWConnection) async {
+    private func accept(_ stream: PeerStream) async {
         guard let key else {
-            connection.cancel()
+            stream.close()
             return
         }
         let generation = self.generation
-        let socket = PeerSocket(connection: connection, role: .server, key: key)
+        let socket = PeerSocket(stream: stream, role: .server, key: key)
         let host = socket.remoteHost
         guard limiter.allow(host) else {
             AppLog.peer.error("Ignoring \(host) after repeated handshake failures")
-            connection.cancel()
+            stream.close()
             return
         }
         do {
@@ -385,22 +530,27 @@ private actor PeerEngine {
     }
 
     private func adopt(_ socket: PeerSocket) {
-        receiveTask?.cancel()
-        if let old = self.socket, old !== socket {
-            old.cancel()
-            failPendings(sentOn: old)
-        }
-        self.socket = socket
-        receiveTask = Task { await self.receiveLoop(socket) }
+        sockets.removeAll { !$0.isOpen }
+        sockets.append(socket)
+        Task { await self.receiveLoop(socket) }
+    }
+
+    private func drop(_ socket: PeerSocket, reason: String) {
+        guard sockets.contains(where: { $0 === socket }) else { return }
+        AppLog.peer.info("link down \(socket.remoteHost): \(reason)")
+        socket.cancel()
+        sockets.removeAll { $0 === socket }
+        failPendings(sentOn: socket)
     }
 
     private func receiveLoop(_ socket: PeerSocket) async {
-        while !Task.isCancelled {
+        var reason = "closed"
+        while true {
             let message: PeerMessage
             do {
                 message = try await socket.receive()
             } catch {
-                AppLog.peer.info("link down: \(error.localizedDescription)")
+                reason = error.localizedDescription
                 break
             }
             if pendings[message.id] != nil {
@@ -409,10 +559,16 @@ private actor PeerEngine {
                 inbox?.yield(Inbound(message: message, socket: socket))
             }
         }
-        socket.cancel()
-        failPendings(sentOn: socket)
-        if self.socket === socket {
-            self.socket = nil
+        drop(socket, reason: reason)
+    }
+
+    /// Closes links that a newer one has replaced and nobody talks on.
+    private func pruneIdle() {
+        guard let newest = preferredSocket else { return }
+        for socket in sockets where socket !== newest {
+            if Date().timeIntervalSince(socket.lastHeard) > Self.idleLimit {
+                drop(socket, reason: "idle")
+            }
         }
     }
 
@@ -437,7 +593,7 @@ private actor PeerEngine {
         }
         guard let reply = await onRequest?(message) else {
             if notable {
-                AppLog.peer.error("in \(message.type) \(message.address ?? "-") ignored")
+                AppLog.peer.error("in \(message.type) ignored")
             }
             return
         }
@@ -453,14 +609,16 @@ private actor PeerEngine {
 
     // MARK: Discovery
 
-    private func resolveEndpoint() -> NWEndpoint? {
-        if let host = settings?.manualHost, let endpoint = PeerEndpoint.endpoint(from: host) {
-            return endpoint
+    private func endpoints() -> [NWEndpoint] {
+        var result: [NWEndpoint] = []
+        func add(_ endpoint: NWEndpoint?) {
+            guard let endpoint, !result.contains(endpoint) else { return }
+            result.append(endpoint)
         }
-        if let host = settings?.learnedHost, let endpoint = PeerEndpoint.endpoint(from: host) {
-            return endpoint
-        }
-        return directory.dialable
+        add(settings?.manualHost.flatMap(PeerEndpoint.endpoint(from:)))
+        add(directory.dialable)
+        add(settings?.learnedHost.flatMap(PeerEndpoint.endpoint(from:)))
+        return result
     }
 
     private func startBrowser() {
@@ -502,7 +660,13 @@ private actor PeerEngine {
 
     private func sendHello() async {
         guard key != nil else { return }
-        let message = PeerMessage(id: UUID(), type: "hello", host: LocalAddress.ipv4())
+        pruneIdle()
+        let message = PeerMessage(
+            type: "hello",
+            devices: status?.devices,
+            held: status?.held.map(\.rawValue),
+            host: LocalAddress.ipv4()
+        )
         _ = try? await request(message, timeout: 3)
     }
 
@@ -519,11 +683,12 @@ private actor PeerEngine {
         announcedPeers = [:]
         dialing?.cancel()
         dialing = nil
-        receiveTask?.cancel()
-        receiveTask = nil
-        socket?.cancel()
-        socket = nil
+        for socket in sockets {
+            socket.cancel()
+        }
+        sockets = []
         failAllPendings()
+        bluetooth.stop()
         await listener.stop()
     }
 }

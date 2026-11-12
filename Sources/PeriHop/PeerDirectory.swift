@@ -88,7 +88,16 @@ enum PeerEndpoint {
     static let defaultPort: UInt16 = 47620
 
     static var parameters: NWParameters {
-        let parameters = NWParameters.tcp
+        let tcp = NWProtocolTCP.Options()
+        tcp.noDelay = true
+        tcp.connectionTimeout = 4
+        // A Mac that falls asleep leaves its sockets open. Keepalive finds
+        // the dead link in about twenty seconds instead of minutes.
+        tcp.enableKeepalive = true
+        tcp.keepaliveIdle = 10
+        tcp.keepaliveInterval = 3
+        tcp.keepaliveCount = 3
+        let parameters = NWParameters(tls: nil, tcp: tcp)
         parameters.includePeerToPeer = true
         return parameters
     }

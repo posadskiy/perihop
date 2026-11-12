@@ -10,7 +10,7 @@ struct SessionCipherTests {
         let key = SymmetricKey(size: .bits256)
         var sender = SessionCipher(key: key)
         var receiver = SessionCipher(key: key)
-        let frame = try sender.seal(PeerMessage(id: UUID(), type: "release", address: "aa-bb-cc-dd-ee-ff"))
+        let frame = try sender.seal(PeerMessage(type: "release", addresses: ["aa-bb-cc-dd-ee-ff"]))
 
         #expect(try receiver.open(frame).type == "release")
         #expect(throws: SessionCipher.Failure.replayed) { try receiver.open(frame) }
@@ -18,7 +18,7 @@ struct SessionCipherTests {
 
     @Test func ownFrameReflectedBackIsRejected() throws {
         var cipher = SessionCipher(key: SymmetricKey(size: .bits256))
-        let frame = try cipher.seal(PeerMessage(id: UUID(), type: "ping"))
+        let frame = try cipher.seal(PeerMessage(type: "ping"))
 
         #expect(throws: SessionCipher.Failure.replayed) { try cipher.open(frame) }
     }
@@ -27,7 +27,7 @@ struct SessionCipherTests {
         let key = SymmetricKey(size: .bits256)
         var sender = SessionCipher(key: key)
         var receiver = SessionCipher(key: key)
-        let frame = try sender.seal(PeerMessage(id: UUID(), type: "ping"))
+        let frame = try sender.seal(PeerMessage(type: "ping"))
         var tampered = frame
         tampered[tampered.count - 1] ^= 0xff
 
@@ -119,25 +119,89 @@ struct PeerSocketTests {
     }
 }
 
-@MainActor
-struct ReconnectSuppressorTests {
-    @Test func replacedLoopDoesNotOrphanItsReplacement() async throws {
-        let suppressor = ReconnectSuppressor(interval: 0.01)
-        let address = DeviceAddress("aa:bb:cc:dd:ee:ff")
-        var closes = 0
-        suppressor.start(address, safetyTimeout: 60) { nil }
-        suppressor.start(address, safetyTimeout: 60) {
-            closes += 1
-            return kIOReturnSuccess
-        }
-        try await Task.sleep(nanoseconds: 100_000_000)
-        #expect(suppressor.isSuppressing(address))
+/// The Bluetooth link runs the same socket over a pair of streams. Two bound
+/// stream pairs stand in for the L2CAP channel.
+struct ChannelStreamTests {
+    private func pipe() -> (near: ChannelStream, far: ChannelStream) {
+        var nearIn: InputStream?, nearOut: OutputStream?, farIn: InputStream?, farOut: OutputStream?
+        Stream.getBoundStreams(withBufferSize: 4096, inputStream: &nearIn, outputStream: &farOut)
+        Stream.getBoundStreams(withBufferSize: 4096, inputStream: &farIn, outputStream: &nearOut)
+        return (
+            ChannelStream(input: nearIn!, output: nearOut!, label: "near"),
+            ChannelStream(input: farIn!, output: farOut!, label: "far")
+        )
+    }
 
-        suppressor.stop(address)
-        try await Task.sleep(nanoseconds: 30_000_000)
-        let stoppedAt = closes
-        try await Task.sleep(nanoseconds: 100_000_000)
-        #expect(closes == stoppedAt)
-        #expect(!suppressor.isSuppressing(address))
+    @Test func handshakeAndMessagesCrossAChannel() async throws {
+        let key = SymmetricKey(size: .bits256)
+        let (near, far) = pipe()
+        let client = PeerSocket(stream: near, role: .client, key: key)
+        let server = PeerSocket(stream: far, role: .server, key: key)
+
+        async let accepted: Void = server.open(timeout: 5)
+        try await client.open(timeout: 5)
+        try await accepted
+
+        // Larger than the stream buffer, so it has to go out in pieces.
+        let devices = (0..<200).map { DeviceEntry(name: "Keyboard \($0)", address: DeviceAddress("aa-bb-cc-dd-ee-ff")) }
+        try await client.send(PeerMessage(type: "take", devices: devices))
+        let received = try await server.receive()
+        #expect(received.type == "take")
+        #expect(received.devices?.count == 200)
+
+        try await server.send(received.reply(type: "taking"))
+        #expect(try await client.receive().type == "taking")
+        client.cancel()
+        server.cancel()
+    }
+
+    @Test func wrongCodeIsRejectedOverAChannel() async throws {
+        let (near, far) = pipe()
+        let client = PeerSocket(stream: near, role: .client, key: SymmetricKey(size: .bits256))
+        let server = PeerSocket(stream: far, role: .server, key: SymmetricKey(size: .bits256))
+
+        async let accepted: Void = { try? await server.open(timeout: 2) }()
+        await #expect(throws: PeerError.handshakeFailed) {
+            try await client.open(timeout: 2)
+        }
+        await accepted
+    }
+
+    @Test func closingOneEndEndsAWaitingRead() async throws {
+        let (near, far) = pipe()
+        try await near.open()
+        try await far.open()
+        let reading = Task { try await far.readChunk() }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        far.close()
+        await #expect(throws: (any Error).self) { _ = try await reading.value }
+    }
+
+    @Test func serviceIdentifierDependsOnThePairingCode() {
+        let first = BluetoothLink.identifier("perihop-ble-service", key: PeerCrypto.deriveKey(code: "ABCD"))
+        let again = BluetoothLink.identifier("perihop-ble-service", key: PeerCrypto.deriveKey(code: "ABCD"))
+        let other = BluetoothLink.identifier("perihop-ble-service", key: PeerCrypto.deriveKey(code: "ABCE"))
+        #expect(first == again)
+        #expect(first != other)
+    }
+}
+
+struct PeerMessageTests {
+    @Test func statusCarriesWhatTheOtherMacHolds() throws {
+        let keyboard = DeviceEntry(name: "Magic Keyboard", address: "aa-bb-cc-dd-ee-ff")
+        let request = PeerMessage(type: "status")
+        let reply = request.reply(type: "status", devices: [keyboard], held: ["AA:BB:CC:DD:EE:FF"])
+        let decoded = try PeerMessage.decoder.decode(PeerMessage.self, from: PeerMessage.encoder.encode(reply))
+
+        #expect(decoded.id == request.id)
+        #expect(decoded.version == PeerMessage.currentVersion)
+        #expect(decoded.status == PeerStatus(held: [keyboard.address], devices: [keyboard]))
+    }
+
+    @Test func messageFromAnOlderVersionStillDecodes() throws {
+        let old = #"{"id":"6F1C1A0E-3C54-4C0B-9C0B-0E5A7B0B3D11","type":"claims","stamps":[]}"#
+        let decoded = try PeerMessage.decoder.decode(PeerMessage.self, from: Data(old.utf8))
+        #expect(decoded.version == nil)
+        #expect(decoded.status == nil)
     }
 }

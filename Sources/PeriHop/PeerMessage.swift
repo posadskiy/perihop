@@ -23,41 +23,72 @@ enum PeerError: Error, LocalizedError, Sendable, Equatable {
     }
 }
 
+/// One message between the Macs. A reply carries the id of its request.
+///
+/// | type | sender means | reply |
+/// | --- | --- | --- |
+/// | `ping` | are you there | `pong` |
+/// | `status` | what do you have | `status` with `held` and `devices` |
+/// | `release` | let go of `addresses` | `released` with the ones freed |
+/// | `take` | I freed `devices`, connect them | `taking`, or `declined` |
+/// | `outcome` | `addresses` did or did not connect (`ok`) | `ack` |
+/// | `hello` | my address is `host`, I have `held` | `ack` |
 struct PeerMessage: Codable, Sendable, Equatable {
+    /// Bumped when the two Macs can no longer understand each other.
+    static let currentVersion = 2
+
     var id: UUID
     var type: String
-    var address: String?
     var addresses: [String]?
-    var forget: Bool?
-    var stamps: [ClaimStamp]?
-    var name: String?
+    var devices: [DeviceEntry]?
+    var held: [String]?
+    var ok: Bool?
     var host: String?
+    var version: Int?
 
-    func reply(type: String, stamps: [ClaimStamp]? = nil) -> PeerMessage {
-        PeerMessage(id: id, type: type, address: address, addresses: addresses, forget: forget, stamps: stamps, name: name, host: host)
+    init(
+        id: UUID = UUID(),
+        type: String,
+        addresses: [String]? = nil,
+        devices: [DeviceEntry]? = nil,
+        held: [String]? = nil,
+        ok: Bool? = nil,
+        host: String? = nil
+    ) {
+        self.id = id
+        self.type = type
+        self.addresses = addresses
+        self.devices = devices
+        self.held = held
+        self.ok = ok
+        self.host = host
+        self.version = Self.currentVersion
     }
 
-    static let encoder: JSONEncoder = {
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        return encoder
-    }()
+    func reply(
+        type: String,
+        addresses: [String]? = nil,
+        devices: [DeviceEntry]? = nil,
+        held: [String]? = nil
+    ) -> PeerMessage {
+        PeerMessage(id: id, type: type, addresses: addresses, devices: devices, held: held)
+    }
 
-    static let decoder: JSONDecoder = {
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        return decoder
-    }()
+    var status: PeerStatus? {
+        guard let held else { return nil }
+        return PeerStatus(held: held.map { DeviceAddress($0) }, devices: devices ?? [])
+    }
+
+    static let encoder = JSONEncoder()
+    static let decoder = JSONDecoder()
 }
 
 /// Log formatting for peer messages. Heartbeats stay out of the log.
 enum PeerTraffic {
     static func notable(_ message: PeerMessage) -> Bool {
         switch message.type {
-        case "ping", "pong", "hello":
+        case "ping", "pong", "hello", "ack", "status":
             return false
-        case "ack":
-            return message.address != nil || message.addresses != nil || message.stamps != nil
         default:
             return true
         }
@@ -65,16 +96,17 @@ enum PeerTraffic {
 
     static func line(_ message: PeerMessage) -> String {
         var parts = ["\(message.type) id=\(message.id.uuidString.prefix(8))"]
-        if let address = message.address { parts.append(address) }
-        if let forget = message.forget { parts.append("forget=\(forget)") }
         if let addresses = message.addresses, !addresses.isEmpty {
             parts.append(addresses.joined(separator: ","))
         }
-        if let host = message.host, !host.isEmpty { parts.append("host=\(host)") }
-        if let stamps = message.stamps {
-            let summary = stamps.map { "\($0.address) mine=\($0.mine)" }.joined(separator: ";")
-            parts.append("stamps=\(summary)")
+        if let devices = message.devices, !devices.isEmpty {
+            parts.append(devices.map(\.address.rawValue).joined(separator: ","))
         }
-        return parts.joined(separator: " ")
+        if let ok = message.ok { parts.append("ok=\(ok)") }
+        return parts.join(" ")
     }
+}
+
+private extension Array where Element == String {
+    func join(_ separator: String) -> String { joined(separator: separator) }
 }
