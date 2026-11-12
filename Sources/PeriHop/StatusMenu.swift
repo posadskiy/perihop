@@ -55,6 +55,34 @@ final class StatusMenu: NSObject {
         }
     }
 
+    /// Opens the panel, for `perihop://show`.
+    func open() {
+        guard panel?.isVisible != true else { return }
+        show()
+    }
+
+    #if DEBUG
+    /// Draws the open panel into a PNG, so a change to the menu can be
+    /// looked at without a screen recording permission.
+    func snapshot(to url: URL) {
+        open()
+        relayout()
+        guard let host else { return }
+        host.layoutSubtreeIfNeeded()
+        guard let bitmap = host.bitmapImageRepForCachingDisplay(in: host.bounds),
+              let context = NSGraphicsContext(bitmapImageRep: bitmap) else { return }
+        // The panel's material is not part of the view, so stand in for it.
+        let dark = host.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = context
+        NSColor(white: dark ? 0.16 : 0.94, alpha: 1).setFill()
+        host.bounds.fill()
+        NSGraphicsContext.restoreGraphicsState()
+        host.displayIgnoringOpacity(host.bounds, in: context)
+        try? bitmap.representation(using: .png, properties: [:])?.write(to: url)
+    }
+    #endif
+
     @objc private func toggle() {
         if ProcessInfo.processInfo.systemUptime - closedAt < 0.25 { return }
         if panel?.isVisible == true {
@@ -71,6 +99,7 @@ final class StatusMenu: NSObject {
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
         statusItem?.button?.highlight(true)
+        Task { await model?.refresh() }
         installMonitors()
         relayoutSoon()
     }
@@ -100,11 +129,29 @@ final class StatusMenu: NSObject {
         panel.isMovable = false
         panel.hidesOnDeactivate = false
         panel.isOpaque = false
-        panel.backgroundColor = .windowBackgroundColor
+        panel.backgroundColor = .clear
         panel.hasShadow = true
         panel.titleVisibility = .hidden
         panel.titlebarAppearsTransparent = true
-        panel.contentView = host
+        // The material and corner radius of a system menu. The hosting view
+        // sits inside it and still decides the size.
+        let backdrop = NSVisualEffectView()
+        backdrop.material = .popover
+        backdrop.blendingMode = .behindWindow
+        backdrop.state = .active
+        backdrop.wantsLayer = true
+        backdrop.layer?.cornerRadius = 14
+        backdrop.layer?.cornerCurve = .continuous
+        backdrop.layer?.masksToBounds = true
+        host.translatesAutoresizingMaskIntoConstraints = false
+        backdrop.addSubview(host)
+        NSLayoutConstraint.activate([
+            host.leadingAnchor.constraint(equalTo: backdrop.leadingAnchor),
+            host.trailingAnchor.constraint(equalTo: backdrop.trailingAnchor),
+            host.topAnchor.constraint(equalTo: backdrop.topAnchor),
+            host.bottomAnchor.constraint(equalTo: backdrop.bottomAnchor),
+        ])
+        panel.contentView = backdrop
         self.host = host
         self.panel = panel
         return panel
@@ -203,7 +250,6 @@ private struct MenuRoot: View {
         ContentView()
             .environmentObject(model)
             .fixedSize()
-            .background(Color(nsColor: .windowBackgroundColor))
     }
 }
 

@@ -11,7 +11,12 @@ struct InfoView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Image(systemName: "keyboard")
+                Button(action: onDone) {
+                    Image(systemName: "chevron.left")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .accessibilityLabel("Back")
                 Text("PeriHop").font(.headline)
                 Spacer()
                 Text("Version \(version)")
@@ -56,16 +61,8 @@ struct InfoView: View {
             .buttonStyle(.plain)
             .font(.caption)
             .foregroundStyle(.secondary)
-
-            Divider()
-            HStack {
-                Spacer()
-                Button("Done", action: onDone)
-                    .buttonStyle(.borderedProminent)
-            }
         }
-        .padding(16)
-        .frame(width: 300)
+        .padding(MenuLayout.padding)
     }
 
     @ViewBuilder

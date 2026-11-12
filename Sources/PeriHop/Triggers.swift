@@ -169,22 +169,3 @@ final class DisplayWatcher: @unchecked Sendable {
         return CFUUIDCreateString(nil, uuid) as String
     }
 }
-
-final class URLReceiver: NSObject {
-    var onURL: (@Sendable (URL) -> Void)?
-
-    func start() {
-        NSAppleEventManager.shared().setEventHandler(
-            self,
-            andSelector: #selector(handle(_:with:)),
-            forEventClass: AEEventClass(kInternetEventClass),
-            andEventID: AEEventID(kAEGetURL)
-        )
-    }
-
-    @objc func handle(_ event: NSAppleEventDescriptor, with reply: NSAppleEventDescriptor) {
-        guard let string = event.paramDescriptor(forKeyword: AEKeyword(keyDirectObject))?.stringValue,
-              let url = URL(string: string) else { return }
-        onURL?(url)
-    }
-}

@@ -9,9 +9,9 @@
     <key>CFBundleIdentifier</key>
     <string>com.posadskiy.perihop</string>
     <key>CFBundleVersion</key>
-    <string>2</string>
+    <string>3</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.2.0</string>
+    <string>0.3.0</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleExecutable</key>
@@ -21,11 +21,11 @@
     <key>LSUIElement</key>
     <true/>
     <key>LSMinimumSystemVersion</key>
-    <string>13.0</string>
+    <string>26.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSBluetoothAlwaysUsageDescription</key>
-    <string>PeriHop needs Bluetooth access to move your keyboard and trackpad to this Mac.</string>
+    <string>PeriHop uses Bluetooth to move your keyboard and trackpad between your Macs, and to reach your other Mac when the network cannot.</string>
     <key>NSBluetoothPeripheralUsageDescription</key>
     <string>PeriHop needs Bluetooth access to move your keyboard and trackpad to this Mac.</string>
     <key>NSLocalNetworkUsageDescription</key>

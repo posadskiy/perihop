@@ -1,38 +1,72 @@
-import SwiftUI
 import AppKit
 import ServiceManagement
+import SwiftUI
 
 struct SettingsView: View {
     var onDone: () -> Void
+    var onAbout: () -> Void
 
     @EnvironmentObject private var model: AppModel
     @AppStorage("showDeviceAddresses") private var showDeviceAddresses = false
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
     @State private var errorMessage: String?
-    @State private var code: String = ""
-    @State private var host: String = ""
-    @State private var showIPAddress = false
+    @State private var code = ""
+    @State private var host = ""
+    @State private var showAddress = false
     @State private var confirmUnpair = false
-    @AppStorage("showDebugTools") private var showDebugTools = false
     @State private var displays: [DockDisplay] = []
     @State private var exporting = false
     @State private var exportNote: String?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Settings").font(.headline)
+        VStack(alignment: .leading, spacing: 14) {
+            PageHeader(title: "Settings", onBack: done)
 
-            Toggle("Launch at Login", isOn: $launchAtLogin)
-                .onChange(of: launchAtLogin) { newValue in
-                    setLaunchAtLogin(newValue)
-                }
-
-            Toggle("Show device addresses", isOn: $showDeviceAddresses)
-
+            otherMac
             Divider()
+            behavior
+            Divider()
+            shortcuts
+            Divider()
+            dock
+            Divider()
+            diagnostics
 
-            Text("Link the other Mac").font(.subheadline)
-            Text(isLinked ? "Linked with the other Mac." : "Leave this code on screen for the other Mac to type, or type that Mac's code here and press Pair.")
+            if let message = model.pairingCodeError ?? errorMessage {
+                ErrorBox(message: message)
+            }
+        }
+        .toggleStyle(.switch)
+        .controlSize(.small)
+        .padding(MenuLayout.padding)
+        .onAppear {
+            code = model.pairingCode.isEmpty ? model.prepareOffer() : model.pairingCode
+            host = model.peerHost
+            showAddress = !host.isEmpty
+            displays = DisplayWatcher.externalOnline()
+        }
+        .onChange(of: code) { _, newValue in
+            let capped = String(PairingCode.normalize(newValue).prefix(max(PairingCode.length, model.pairingCode.count)))
+            if capped != code { code = capped }
+        }
+        .onChange(of: model.pairingCode) { _, newValue in
+            if !newValue.isEmpty { code = newValue }
+        }
+        .onChange(of: showAddress) { StatusMenu.shared.relayoutSoon() }
+        .onDisappear { model.saveShortcuts() }
+        .alert("Unlink the other Mac?", isPresented: $confirmUnpair) {
+            Button("Unlink", role: .destructive) { unpair() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This Mac forgets the code and shows a new one. The other Mac has to use that code to link again.")
+        }
+    }
+
+    // MARK: Sections
+
+    private var otherMac: some View {
+        MenuSection(title: "Other Mac") {
+            Text(linkText)
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -41,9 +75,10 @@ struct SettingsView: View {
                 TextField("Code", text: $code)
                     .textFieldStyle(.roundedBorder)
                     .font(.title3.monospaced())
-                    .disabled(isLinked || model.isPairing)
-                if isLinked {
-                    Button("Unpair") { confirmUnpair = true }
+                    .disabled(model.isLinked || model.isPairing)
+                    .accessibilityLabel("Pairing code")
+                if model.isLinked {
+                    Button("Unlink") { confirmUnpair = true }
                 } else {
                     Button {
                         code = model.refreshOffer()
@@ -53,48 +88,80 @@ struct SettingsView: View {
                     .buttonStyle(.borderless)
                     .help("New code")
                     .disabled(model.isPairing)
-                    Button(model.isPairing ? "Pairing…" : "Pair") {
-                        Task { await connect() }
+                    Button(model.isPairing ? "Linking…" : "Link") {
+                        Task { await link() }
                     }
+                    .buttonStyle(.borderedProminent)
                     .disabled(model.isPairing)
                 }
             }
+            .controlSize(.regular)
 
-            if showIPAddress {
+            if model.peerState == .untrusted {
+                HStack {
+                    Text("The other Mac's pairing code changed.").font(.caption)
+                    Spacer()
+                    Button("Trust") { model.trustOffered() }
+                }
+            }
+
+            Toggle(isOn: $model.bluetoothLink) {
+                label("Reach it over Bluetooth", "Used when a VPN or the Wi-Fi keeps the two Macs apart.")
+            }
+
+            if showAddress {
                 TextField("Other Mac's IP address", text: $host)
                     .textFieldStyle(.roundedBorder)
-                Text("Used when the other Mac doesn't appear on its own.")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                    .controlSize(.regular)
             } else {
-                Button("Use IP address") { showIPAddress = true }
+                Button("Enter its IP address…") { showAddress = true }
+                    .buttonStyle(.link)
                     .font(.caption)
             }
+        }
+    }
 
-            if model.trustMismatch {
-                Text("The other Mac's identity changed.")
-                    .font(.caption)
-                Button("Trust this Mac") { model.trustOffered() }
+    private var behavior: some View {
+        MenuSection(title: "Automatic") {
+            Toggle(isOn: $model.releaseOnSleep) {
+                label(
+                    "Let go when this Mac sleeps",
+                    "The other Mac takes the devices if it is awake. With the lid closed on a display they stay otherwise, so the keyboard can wake this Mac."
+                )
             }
+            .disabled(!model.isLinked)
+            Toggle(isOn: $model.takeOnWake) {
+                label("Take free devices on wake", "Never from a Mac that is using them.")
+            }
+            .disabled(!model.isLinked)
+            Toggle(isOn: $model.reconnectDropped) {
+                label("Reconnect a device that drops", "For example after it was switched off and on.")
+            }
+            Toggle(isOn: $launchAtLogin) {
+                Text("Open at login").frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .onChange(of: launchAtLogin) { _, newValue in
+                setLaunchAtLogin(newValue)
+            }
+        }
+    }
 
-            Divider()
-            Text("Shortcuts").font(.subheadline)
+    private var shortcuts: some View {
+        MenuSection(title: "Shortcuts") {
             ShortcutButton(title: "Use here", shortcut: $model.takeShortcut)
-            ShortcutButton(title: "Hand off", shortcut: $model.sendShortcut)
+            ShortcutButton(title: "Send to other Mac", shortcut: $model.sendShortcut)
             ShortcutButton(title: "Toggle", shortcut: $model.toggleShortcut)
-            Text("Recorded while this window is open. Esc clears a shortcut.")
+            Text("Click a shortcut, then type it. Esc clears it.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
+        }
+    }
 
-            Divider()
-            Text("Dock a display").font(.subheadline)
-            Text("When a checked display connects, PeriHop takes the devices.")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
+    private var dock: some View {
+        MenuSection(title: "Take devices when a display connects") {
             if displays.isEmpty {
-                Text("No external displays connected.")
-                    .font(.caption2)
+                Text("No external display is connected right now.")
+                    .font(.caption)
                     .foregroundStyle(.secondary)
             }
             ForEach(displays) { display in
@@ -102,73 +169,66 @@ struct SettingsView: View {
                     get: { model.dockDisplays.contains(display.id) },
                     set: { model.setDock(display.id, enabled: $0) }
                 )) {
-                    Text(display.name).lineLimit(1)
+                    Text(display.name).lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
+        }
+    }
 
-            if let message = model.pairingCodeError ?? errorMessage {
-                ErrorBox(message: message)
+    private var diagnostics: some View {
+        MenuSection(title: "Troubleshooting") {
+            Toggle(isOn: $showDeviceAddresses) {
+                Text("Show device addresses").frame(maxWidth: .infinity, alignment: .leading)
             }
-
-            Divider()
-            Toggle("Debug", isOn: $showDebugTools)
-            if showDebugTools {
-                HStack {
-                    Button(exporting ? "Saving…" : "Save diagnostics") {
-                        Task { await saveDiagnostics() }
-                    }
+            HStack {
+                Button(exporting ? "Saving…" : "Save Diagnostics…") {
+                    Task { await saveDiagnostics() }
+                }
+                .disabled(exporting)
+                Button("Clear") { clearDiagnostics() }
                     .disabled(exporting)
-                    Button("Clear diagnostics") { clearDiagnostics() }
-                        .disabled(exporting)
-                }
-                Text("Save writes the switch, link, and Bluetooth log. Clear keeps only what happens after this moment.")
+                Spacer()
+                Button("About", action: onAbout)
+                    .buttonStyle(.link)
+            }
+            if let exportNote {
+                Text(exportNote)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                if let exportNote {
-                    Text(exportNote)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
             }
-
-            HStack {
-                Spacer()
-                Button("Done", action: done)
-                    .buttonStyle(.borderedProminent)
-            }
-        }
-        .padding(16)
-        .frame(width: 340)
-        .onAppear {
-            code = model.pairingCode.isEmpty ? model.prepareOffer() : model.pairingCode
-            host = model.peerHost
-            showIPAddress = !host.isEmpty
-            displays = DisplayWatcher.externalOnline()
-        }
-        .onChange(of: code) { newValue in
-            let capped = cappedCode(newValue)
-            if capped != code { code = capped }
-        }
-        .onChange(of: model.pairingCode) { newValue in
-            if !newValue.isEmpty { code = newValue }
-        }
-        .onDisappear { model.saveShortcuts() }
-        .alert("Unpair the other Mac?", isPresented: $confirmUnpair) {
-            Button("Unpair", role: .destructive) { unpair() }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("This Mac forgets the code and shows a new one. The other Mac has to use that code to link again.")
         }
     }
 
-    private var isLinked: Bool {
-        !model.pairingCode.isEmpty
+    private func label(_ title: String, _ detail: String) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(title)
+            Text(detail)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private func connect() async {
-        let ok = await model.pair(code: code, host: showIPAddress ? host : "")
-        if ok {
+    private var linkText: String {
+        switch model.peerState {
+        case .notLinked:
+            return "Open Settings on both Macs. Type the code one Mac shows into the other, then press Link there."
+        case .reachable(let bluetooth):
+            return bluetooth ? "Linked. The other Mac answers over Bluetooth." : "Linked. The other Mac answers."
+        case .unreachable:
+            return "Linked. The other Mac is asleep or away."
+        case .untrusted:
+            return "Linked, but the other Mac now shows a different code."
+        case .outdated:
+            return "Linked. The other Mac runs an older PeriHop and needs an update."
+        }
+    }
+
+    // MARK: Actions
+
+    private func link() async {
+        if await model.pair(code: code, host: showAddress ? host : "") {
             code = model.pairingCode
             host = model.peerHost
         }
@@ -179,36 +239,27 @@ struct SettingsView: View {
             await model.unpair()
             code = model.prepareOffer()
             host = ""
-            showIPAddress = false
+            showAddress = false
         }
     }
 
     private func done() {
-        if isLinked {
-            model.updatePeerHost(showIPAddress ? host : model.peerHost)
+        if model.isLinked {
+            model.updatePeerHost(showAddress ? host : "")
         }
         onDone()
     }
 
-    private func cappedCode(_ raw: String) -> String {
-        let normalized = PairingCode.normalize(raw)
-        let saved = PairingCode.normalize(model.pairingCode)
-        if saved.count > PairingCode.length, normalized == saved {
-            return saved
-        }
-        return String(normalized.prefix(PairingCode.length))
-    }
-
     private func clearDiagnostics() {
         DiagnosticReport.clear()
-        exportNote = "Diagnostics cleared. The next save starts from now."
+        exportNote = "Cleared. The next save starts from now."
         errorMessage = nil
     }
 
     private func saveDiagnostics() async {
         exporting = true
         defer { exporting = false }
-        let report = await DiagnosticReport.make(devices: model.config?.devices ?? [])
+        let report = await DiagnosticReport.make(devices: model.devices)
         guard let url = DiagnosticReport.chooseDestination() else { return }
         do {
             try report.write(to: url, atomically: true, encoding: .utf8)
@@ -244,11 +295,12 @@ private struct ShortcutButton: View {
 
     var body: some View {
         HStack {
-            Text(title).font(.caption)
+            Text(title)
             Spacer()
-            Button(recording ? "Type shortcut" : shortcut.label) {
+            Button(recording ? "Type shortcut…" : shortcut.label) {
                 recording.toggle()
             }
+            .accessibilityLabel("\(title) shortcut, \(shortcut.label)")
         }
         .background(ShortcutMonitor(recording: recording, onCapture: { captured in
             shortcut = captured

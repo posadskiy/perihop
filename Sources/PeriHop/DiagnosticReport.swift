@@ -78,8 +78,7 @@ enum DiagnosticReport {
             lines.append("  (none)")
         } else {
             for device in devices {
-                let since = device.holderSince.map(stamp) ?? "-"
-                lines.append("  \(device.name)  \(device.address.rawValue)  bond=\(device.bondMode.rawValue)  holder=\(device.holder.rawValue)  since=\(since)")
+                lines.append("  \(device.name)  \(device.address.rawValue)")
             }
         }
         return lines.joined(separator: "\n") + "\n"

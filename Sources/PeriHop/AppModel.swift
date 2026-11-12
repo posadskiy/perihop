@@ -2,6 +2,15 @@ import AppKit
 import Combine
 import Foundation
 
+/// What the menu says about the other Mac.
+enum PeerLinkState: Equatable, Sendable {
+    case notLinked
+    case reachable(bluetooth: Bool)
+    case unreachable
+    case untrusted
+    case outdated
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     let handoff: HandoffCoordinator
@@ -13,49 +22,83 @@ final class AppModel: ObservableObject {
     @Published var peerHost: String
     @Published var pairingCodeError: String?
     @Published private(set) var isPairing = false
-    @Published private(set) var peerReachable = false
     @Published private(set) var trustMismatch = false
     @Published private(set) var offeredFingerprint = ""
+    @Published private(set) var peerOutdated = false
+    @Published private(set) var linkOverBluetooth = false
     @Published private(set) var batteries: [DeviceAddress: Int] = [:]
     @Published var takeShortcut = Shortcut.empty
     @Published var sendShortcut = Shortcut.empty
     @Published var toggleShortcut = Shortcut.empty
     @Published var dockDisplays: [String] = []
+    @Published var releaseOnSleep: Bool { didSet { defaults.set(releaseOnSleep, forKey: "releaseOnSleep") } }
+    @Published var takeOnWake: Bool { didSet { defaults.set(takeOnWake, forKey: "takeOnWake") } }
+    @Published var reconnectDropped: Bool { didSet { defaults.set(reconnectDropped, forKey: "reconnectDropped") } }
+    @Published var bluetoothLink: Bool {
+        didSet {
+            defaults.set(bluetoothLink, forKey: "bluetoothLink")
+            restartPeer()
+        }
+    }
 
-    private let bluetooth: LiveBluetoothController
+    #if DEBUG
+    /// Page the menu is asked to show by `perihop://snapshot`.
+    @Published var debugPage = "devices"
+    #endif
+
+    private let defaults = UserDefaults.standard
+    private let bluetooth: BluetoothControlling
     private let notifier = HandoffNotifier()
     private let hotkeys = HotkeyCenter()
     private let displays = DisplayWatcher()
-    private let urls = URLReceiver()
+    private let power = PowerMonitor()
     private var usb: USBAccessoryWatcher?
-    private var sleepObservers: [NSObjectProtocol] = []
+    private var observers: [NSObjectProtocol] = []
     private var cancellables: Set<AnyCancellable> = []
+    private var refreshLoop: Task<Void, Never>?
     /// Code this Mac is listening with before the link is confirmed.
     private var listeningCode = ""
     private var offeredCode = ""
+    private(set) var poweringOff = false
 
-    var menuSymbol: String {
-        if pairingCode.isEmpty || trustMismatch { return "exclamationmark.triangle" }
-        if handoff.activity == .working { return "arrow.left.arrow.right" }
-        let connectedHere = config?.devices.contains { device in
-            handoff.status(for: device.address) == .success
-        } ?? false
-        return connectedHere ? "keyboard.fill" : "keyboard"
+    var devices: [DeviceEntry] { config?.devices ?? [] }
+
+    var isLinked: Bool { !pairingCode.isEmpty }
+
+    var peerState: PeerLinkState {
+        guard isLinked else { return .notLinked }
+        if trustMismatch { return .untrusted }
+        if peerOutdated { return .outdated }
+        return handoff.peerReachable ? .reachable(bluetooth: linkOverBluetooth) : .unreachable
     }
 
-    init() {
-        let bluetooth = LiveBluetoothController()
+    var menuSymbol: String {
+        if trustMismatch || peerOutdated { return "exclamationmark.triangle" }
+        if handoff.isSwitching { return "arrow.left.arrow.right" }
+        let here = devices.contains { handoff.connected.contains($0.address) }
+        return here ? "keyboard.fill" : "keyboard"
+    }
+
+    init(bluetooth: BluetoothControlling = LiveBluetoothController()) {
         let peer = PeerService()
         let handoff = HandoffCoordinator(bluetooth: bluetooth, peer: peer)
         self.bluetooth = bluetooth
         self.peer = peer
         self.handoff = handoff
+        defaults.register(defaults: [
+            "releaseOnSleep": true,
+            "takeOnWake": true,
+            "reconnectDropped": true,
+            "bluetoothLink": true,
+        ])
+        releaseOnSleep = defaults.bool(forKey: "releaseOnSleep")
+        takeOnWake = defaults.bool(forKey: "takeOnWake")
+        reconnectDropped = defaults.bool(forKey: "reconnectDropped")
+        bluetoothLink = defaults.bool(forKey: "bluetoothLink")
         pairingCode = KeychainStore.readCode() ?? ""
-        peerHost = UserDefaults.standard.string(forKey: "peerHost") ?? ""
+        peerHost = defaults.string(forKey: "peerHost") ?? ""
         config = DeviceConfigStore.load()
-        if let config {
-            handoff.useDevices(config.devices)
-        }
+        dockDisplays = defaults.stringArray(forKey: "dockDisplays") ?? []
 
         handoff.onDevicesChanged = { [weak self] devices in
             self?.save(devices)
@@ -64,9 +107,21 @@ final class AppModel: ObservableObject {
             guard let self else { return }
             self.notifier.notify(body: result.summary, menuVisible: self.menuVisible)
         }
+        handoff.switchingAllowed = { [weak self] in self?.trustMismatch != true }
+        handoff.releaseOnSleep = { [weak self] in self?.releaseOnSleep ?? true }
+        handoff.takeOnWake = { [weak self] in self?.takeOnWake ?? true }
+        handoff.reconnectDropped = { [weak self] in self?.reconnectDropped ?? true }
+        handoff.userIsPresent = { PowerMonitor.displayIsAwake() }
+        handoff.wakesFromDevices = {
+            PowerMonitor.lidIsClosed() && !DisplayWatcher.externalOnline().isEmpty
+        }
+        handoff.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }.store(in: &cancellables)
+
+        peer.linked = isLinked
         peer.onRequest = { [weak self] message in
-            guard let self else { return nil }
-            return await self.reply(to: message)
+            await self?.reply(to: message)
         }
         peer.onIdentity = { [weak self] fingerprint, trusted in
             Task { @MainActor in
@@ -74,52 +129,53 @@ final class AppModel: ObservableObject {
                 self?.trustMismatch = !trusted
             }
         }
-        handoff.switchingAllowed = { [weak self] in
-            MainActor.assumeIsolated { self?.trustMismatch != true }
+        if defaults.string(forKey: "pinnedFingerprint") == nil, pairingCode.count >= PairingCode.length {
+            defaults.set(PeerCrypto.fingerprint(code: pairingCode), forKey: "pinnedFingerprint")
         }
-        handoff.objectWillChange.sink { [weak self] _ in
-            self?.objectWillChange.send()
-        }.store(in: &cancellables)
 
-        if UserDefaults.standard.string(forKey: "pinnedFingerprint") == nil, pairingCode.count >= PairingCode.length {
-            UserDefaults.standard.set(PeerCrypto.fingerprint(code: pairingCode), forKey: "pinnedFingerprint")
-        }
+        handoff.useDevices(devices)
+        handoff.start()
         restartPeer()
-        observeSleep()
-        let watcher = USBAccessoryWatcher { [weak self] in
-            Task { @MainActor in
-                await self?.noteCableAttach()
-            }
-        }
-        watcher.start()
-        usb = watcher
-        loadShortcuts()
-        dockDisplays = UserDefaults.standard.stringArray(forKey: "dockDisplays") ?? []
-        hotkeys.onAction = { [weak self] id in
-            Task { @MainActor in
-                guard let self else { return }
-                switch id {
-                case 1: self.bringHere(self.selectedDevices())
-                case 2: self.sendAway(self.selectedDevices())
-                case 3: self.toggle(self.selectedDevices())
-                default: break
-                }
-            }
-        }
-        installHotkeys()
-        displays.onAdded = { [weak self] id in
-            Task { @MainActor in
-                self?.displayConnected(id)
-            }
-        }
-        displays.start()
-        urls.onURL = { [weak self] url in
-            Task { @MainActor in
-                self?.open(url)
-            }
-        }
-        urls.start()
+        observePower()
+        startTriggers()
+        startRefreshing()
     }
+
+    // MARK: Devices
+
+    func saveDevices(_ devices: [DeviceEntry]) throws {
+        let config = DeviceConfig(devices: devices)
+        try DeviceConfigStore.save(config)
+        self.config = config
+        handoff.useDevices(devices)
+    }
+
+    func bringHere(_ devices: [DeviceEntry]) {
+        handoff.useHere(devices: devices)
+    }
+
+    func sendAway(_ devices: [DeviceEntry]) {
+        handoff.handOff(devices: devices)
+    }
+
+    func toggle(_ devices: [DeviceEntry]) {
+        handoff.toggle(devices: devices)
+    }
+
+    /// Re-reads links, the other Mac, and battery levels.
+    func refresh() async {
+        await handoff.refresh()
+        linkOverBluetooth = await peer.usesBluetooth()
+        var levels: [DeviceAddress: Int] = [:]
+        for device in devices where handoff.connected.contains(device.address) {
+            if let percent = await bluetooth.batteryPercent(device.address) {
+                levels[device.address] = percent
+            }
+        }
+        batteries = levels
+    }
+
+    // MARK: Linking the Macs
 
     /// Shows a code and listens for the other Mac. The link is saved only after both sides talk.
     func prepareOffer() -> String {
@@ -154,14 +210,18 @@ final class AppModel: ObservableObject {
             code: normalized,
             manualHost: trimmedHost.isEmpty ? nil : trimmedHost,
             pinnedFingerprint: nil,
-            learnedHost: nil
+            learnedHost: nil,
+            bluetooth: bluetoothLink
         )
-        for attempt in 1...4 {
+        for attempt in 1...3 {
             AppLog.peer.info("pair attempt \(attempt)")
-            if await peer.ping(timeout: 2.5) {
+            // Long enough for the Bluetooth link to come up when the
+            // network keeps the Macs apart.
+            if await peer.ping(timeout: 8) {
                 do {
                     try persistLink(code: normalized, host: trimmedHost)
                     AppLog.peer.info("pair confirmed from this Mac")
+                    await refresh()
                     return true
                 } catch {
                     pairingCodeError = error.localizedDescription
@@ -180,13 +240,16 @@ final class AppModel: ObservableObject {
             offeredCode = ""
             listeningCode = ""
             peerHost = ""
-            UserDefaults.standard.set("", forKey: "peerHost")
-            UserDefaults.standard.removeObject(forKey: "pinnedFingerprint")
-            UserDefaults.standard.removeObject(forKey: "learnedPeerHost")
+            peer.linked = false
+            defaults.set("", forKey: "peerHost")
+            defaults.removeObject(forKey: "pinnedFingerprint")
+            defaults.removeObject(forKey: "learnedPeerHost")
             trustMismatch = false
+            peerOutdated = false
             offeredFingerprint = ""
             pairingCodeError = nil
             await peer.activate(code: "", manualHost: nil, pinnedFingerprint: nil, learnedHost: nil)
+            await handoff.refreshPeer()
         } catch {
             pairingCodeError = error.localizedDescription
         }
@@ -196,38 +259,18 @@ final class AppModel: ObservableObject {
         let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed != peerHost else { return }
         peerHost = trimmed
-        UserDefaults.standard.set(peerHost, forKey: "peerHost")
+        defaults.set(peerHost, forKey: "peerHost")
         restartPeer()
-    }
-
-    func refreshPeer() async {
-        peerReachable = await peer.ping(timeout: 0.8)
-        await refreshBatteries()
-    }
-
-    func bringHere(_ devices: [DeviceEntry]) {
-        handoff.useHere(devices: devices)
-    }
-
-    func sendAway(_ devices: [DeviceEntry]) {
-        handoff.handOff(devices: devices)
-    }
-
-    func toggle(_ devices: [DeviceEntry]) {
-        let here = devices.filter { handoff.status(for: $0.address) == .success }
-        if here.isEmpty {
-            bringHere(devices)
-        } else {
-            sendAway(here)
-        }
     }
 
     func trustOffered() {
         guard !offeredFingerprint.isEmpty else { return }
-        UserDefaults.standard.set(offeredFingerprint, forKey: "pinnedFingerprint")
+        defaults.set(offeredFingerprint, forKey: "pinnedFingerprint")
         trustMismatch = false
         restartPeer()
     }
+
+    // MARK: Triggers
 
     func setDock(_ id: String, enabled: Bool) {
         if enabled {
@@ -235,7 +278,7 @@ final class AppModel: ObservableObject {
         } else {
             dockDisplays.removeAll { $0 == id }
         }
-        UserDefaults.standard.set(dockDisplays, forKey: "dockDisplays")
+        defaults.set(dockDisplays, forKey: "dockDisplays")
     }
 
     func saveShortcuts() {
@@ -245,67 +288,50 @@ final class AppModel: ObservableObject {
         installHotkeys()
     }
 
-    func noteCableAttach() async {
-        guard var config else { return }
-        var changed = false
-        for index in config.devices.indices {
-            let address = config.devices[index].address
-            let paired = await bluetooth.isPaired(address)
-            let connected = await bluetooth.isConnected(address)
-            guard paired || connected else { continue }
-            config.devices[index].holder = .thisMac
-            config.devices[index].holderSince = Date()
-            if config.devices[index].bondMode == .unknown {
-                config.devices[index].bondMode = .multi
-            }
-            handoff.noteConnected(address)
-            changed = true
-        }
-        guard changed else { return }
-        self.config = config
-        handoff.useDevices(config.devices)
-        try? DeviceConfigStore.save(config)
-        notifier.notify(body: "An accessory was plugged in and paired to this Mac.", menuVisible: menuVisible)
+    /// Frees the devices before this Mac shuts down, as it does before sleep.
+    func prepareForPowerOff() async {
+        await handoff.prepareForSleep()
     }
 
+    // MARK: Requests from the other Mac
+
     private func reply(to message: PeerMessage) async -> PeerMessage? {
+        if (message.version ?? 1) < PeerMessage.currentVersion {
+            peerOutdated = true
+        } else if peerOutdated {
+            peerOutdated = false
+        }
         switch message.type {
         case "ping":
             if pairingCode.isEmpty {
                 acceptIncomingLink()
             }
             return message.reply(type: "pong")
-        case "claims":
-            let stamps = handoff.integrateClaims(message.stamps ?? [])
-            return message.reply(type: "claimsAck", stamps: stamps)
+        case "status":
+            return statusReply(to: message, type: "status")
         case "release":
-            guard let raw = message.address else { return nil }
-            let address = DeviceAddress(raw)
-            let released = await handoff.handleRemoteRelease(address, forget: message.forget ?? false)
-            return message.reply(type: released ? "released" : "busy")
-        case "owned":
-            guard let raw = message.address else { return nil }
-            let address = DeviceAddress(raw)
-            await handoff.handleRemoteOwned(address)
-            return message.reply(type: "ack")
-        case "failed":
-            guard let raw = message.address else { return nil }
-            let address = DeviceAddress(raw)
-            await handoff.handleRemoteFailed(address)
-            return message.reply(type: "ack")
-        case "rollback":
-            guard let raw = message.address else { return nil }
-            let address = DeviceAddress(raw)
-            await handoff.handleRemoteRollback(address)
-            return message.reply(type: "rolledBack")
-        case "hello":
-            if peerHost.isEmpty, let host = message.host, !host.isEmpty {
-                UserDefaults.standard.set(host, forKey: "learnedPeerHost")
+            let addresses = (message.addresses ?? []).map { DeviceAddress($0) }
+            let freed = await handoff.handleRelease(addresses)
+            return message.reply(type: "released", addresses: freed.map(\.rawValue).sorted())
+        case "take":
+            // A Mac that woke only to answer the network has nobody at it.
+            guard isLinked, handoff.userIsPresent() else {
+                return message.reply(type: "declined")
+            }
+            handoff.handleTake(message.devices ?? [])
+            return message.reply(type: "taking")
+        case "outcome":
+            for raw in message.addresses ?? [] {
+                handoff.handleOutcome(DeviceAddress(raw), connected: message.ok ?? false)
             }
             return message.reply(type: "ack")
-        case "sleeping":
-            for raw in message.addresses ?? [] {
-                await handoff.handleRemoteSleeping(DeviceAddress(raw))
+        case "hello":
+            if let host = message.host, !host.isEmpty, host != defaults.string(forKey: "learnedPeerHost") {
+                defaults.set(host, forKey: "learnedPeerHost")
+                await peer.learn(host: host)
+            }
+            if let status = message.status {
+                handoff.notePeerStatus(status)
             }
             return message.reply(type: "ack")
         default:
@@ -313,9 +339,15 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func statusReply(to message: PeerMessage, type: String) -> PeerMessage {
+        let status = handoff.localStatus
+        return message.reply(type: type, devices: status.devices, held: status.held.map(\.rawValue))
+    }
+
+    // MARK: Private
+
     private func save(_ devices: [DeviceEntry]) {
-        var config = self.config ?? DeviceConfig(devices: devices)
-        config.devices = devices
+        let config = DeviceConfig(devices: devices)
         self.config = config
         do {
             try DeviceConfigStore.save(config)
@@ -331,7 +363,8 @@ final class AppModel: ObservableObject {
             code: normalized,
             manualHost: peerHost.isEmpty ? nil : peerHost,
             pinnedFingerprint: nil,
-            learnedHost: nil
+            learnedHost: nil,
+            bluetooth: bluetoothLink
         )
     }
 
@@ -352,9 +385,10 @@ final class AppModel: ObservableObject {
         try KeychainStore.saveCode(normalized)
         pairingCode = normalized
         offeredCode = normalized
+        peer.linked = true
         peerHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
-        UserDefaults.standard.set(peerHost, forKey: "peerHost")
-        UserDefaults.standard.set(PeerCrypto.fingerprint(code: normalized), forKey: "pinnedFingerprint")
+        defaults.set(peerHost, forKey: "peerHost")
+        defaults.set(PeerCrypto.fingerprint(code: normalized), forKey: "pinnedFingerprint")
         trustMismatch = false
         pairingCodeError = nil
     }
@@ -363,75 +397,136 @@ final class AppModel: ObservableObject {
         peer.start(
             code: pairingCode,
             manualHost: peerHost.isEmpty ? nil : peerHost,
-            pinnedFingerprint: UserDefaults.standard.string(forKey: "pinnedFingerprint"),
-            learnedHost: UserDefaults.standard.string(forKey: "learnedPeerHost")
+            pinnedFingerprint: defaults.string(forKey: "pinnedFingerprint"),
+            learnedHost: defaults.string(forKey: "learnedPeerHost"),
+            bluetooth: bluetoothLink
         )
     }
 
-    private func selectedDevices() -> [DeviceEntry] {
-        config?.devices ?? []
+    private func observePower() {
+        power.budget = 6
+        power.onWillSleep = { [weak self] in
+            await self?.handoff.prepareForSleep()
+        }
+        power.onDidWake = { [weak self] in
+            Task { @MainActor in
+                await self?.handoff.didWake()
+                await self?.refresh()
+            }
+        }
+        power.start()
+        observers.append(
+            NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.willPowerOffNotification, object: nil, queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated { self?.poweringOff = true }
+            }
+        )
     }
 
-    private func open(_ url: URL) {
-        guard url.scheme == "perihop" else { return }
-        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
-        let direction = items.first(where: { $0.name == "direction" })?.value ?? "take"
-        let filters = items.filter { $0.name == "peripheral" }.compactMap(\.value)
-        let devices = matching(filters)
-        switch direction {
-        case "send":
-            sendAway(devices)
-        case "toggle":
-            toggle(devices)
-        default:
-            bringHere(devices)
+    private func startTriggers() {
+        // A Magic accessory pairs itself when its cable is plugged in.
+        let watcher = USBAccessoryWatcher { [weak self] in
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                await self?.refresh()
+            }
+        }
+        watcher.start()
+        usb = watcher
+        takeShortcut = load("hotkeyTake")
+        sendShortcut = load("hotkeySend")
+        toggleShortcut = load("hotkeyToggle")
+        hotkeys.onAction = { [weak self] id in
+            Task { @MainActor in
+                guard let self else { return }
+                switch id {
+                case 1: self.bringHere(self.devices)
+                case 2: self.sendAway(self.devices)
+                case 3: self.toggle(self.devices)
+                default: break
+                }
+            }
+        }
+        installHotkeys()
+        displays.onAdded = { [weak self] id in
+            Task { @MainActor in
+                guard let self, self.dockDisplays.contains(id) else { return }
+                self.bringHere(self.devices)
+            }
+        }
+        displays.start()
+    }
+
+    /// Link events keep the state current. This slow poll is the safety net
+    /// for one that never arrives, and keeps the other Mac's side fresh.
+    private func startRefreshing() {
+        refreshLoop = Task { [weak self] in
+            while !Task.isCancelled {
+                await self?.refresh()
+                let pause: UInt64 = self?.menuVisible == true ? 5 : 30
+                try? await Task.sleep(nanoseconds: pause * 1_000_000_000)
+            }
         }
     }
 
-    private func matching(_ filters: [String]) -> [DeviceEntry] {
-        let devices = config?.devices ?? []
+    /// `perihop://switch?direction=take|send|toggle&peripheral=name` moves
+    /// devices. `perihop://show` opens the menu.
+    func open(_ url: URL) {
+        guard url.scheme == "perihop" else { return }
+        AppLog.switchFlow.info("url \(url.absoluteString)")
+        if url.host == "show" {
+            StatusMenu.shared.open()
+            return
+        }
+        #if DEBUG
+        if url.host == "snapshot" {
+            let query = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+            debugPage = query.first(where: { $0.name == "page" })?.value ?? "devices"
+            StatusMenu.shared.open()
+            if let path = query.first(where: { $0.name == "path" })?.value {
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 700_000_000)
+                    StatusMenu.shared.snapshot(to: URL(fileURLWithPath: path))
+                }
+            }
+            return
+        }
+        #endif
+        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        let direction = items.first(where: { $0.name == "direction" })?.value ?? "take"
+        let filters = items.filter { $0.name == "peripheral" }.compactMap(\.value)
+        let chosen = Self.matching(filters, in: devices)
+        switch direction {
+        case "send":
+            sendAway(chosen)
+        case "toggle":
+            toggle(chosen)
+        default:
+            bringHere(chosen)
+        }
+    }
+
+    nonisolated static func matching(_ filters: [String], in devices: [DeviceEntry]) -> [DeviceEntry] {
         guard !filters.isEmpty else { return devices }
         return devices.filter { device in
             filters.contains { filter in
                 let needle = filter.lowercased()
-                return device.name.lowercased() == needle
-                    || device.address.rawValue.lowercased() == needle
+                return device.address.rawValue == DeviceAddress(filter).rawValue
                     || device.name.lowercased().contains(needle)
             }
         }
     }
 
-    private func displayConnected(_ id: String) {
-        guard dockDisplays.contains(id) else { return }
-        bringHere(selectedDevices())
-    }
-
-    private func refreshBatteries() async {
-        guard let config else { return }
-        var next: [DeviceAddress: Int] = [:]
-        for device in config.devices {
-            if let percent = await bluetooth.batteryPercent(device.address) {
-                next[device.address] = percent
-            }
-        }
-        batteries = next
-    }
-
-    private func loadShortcuts() {
-        takeShortcut = load("hotkeyTake")
-        sendShortcut = load("hotkeySend")
-        toggleShortcut = load("hotkeyToggle")
-    }
-
     private func load(_ key: String) -> Shortcut {
-        guard let data = UserDefaults.standard.data(forKey: key),
+        guard let data = defaults.data(forKey: key),
               let shortcut = try? JSONDecoder().decode(Shortcut.self, from: data) else { return .empty }
         return shortcut
     }
 
     private func store(_ shortcut: Shortcut, key: String) {
         if let data = try? JSONEncoder().encode(shortcut) {
-            UserDefaults.standard.set(data, forKey: key)
+            defaults.set(data, forKey: key)
         }
     }
 
@@ -441,23 +536,5 @@ final class AppModel: ObservableObject {
             (2, sendShortcut),
             (3, toggleShortcut),
         ])
-    }
-
-    private func observeSleep() {
-        let center = NSWorkspace.shared.notificationCenter
-        sleepObservers.append(
-            center.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
-                Task { @MainActor in
-                    await self?.handoff.handleWillSleep()
-                }
-            }
-        )
-        sleepObservers.append(
-            center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
-                Task { @MainActor in
-                    await self?.handoff.handleDidWake()
-                }
-            }
-        )
     }
 }
